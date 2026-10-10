@@ -61,6 +61,29 @@ def is_musa_runtime() -> bool:
     return getattr(torch.version, "musa", None) is not None
 
 
+@cache_once
+def is_sail_runtime() -> bool:
+    # T-HEAD SAIL device names carry the "ZW" tag; keep the check aligned with
+    # sglang.srt.utils.is_sail so all layers agree on what "running on SAIL" means.
+    return bool(torch.cuda.is_available() and "ZW" in torch.cuda.get_device_name())
+
+
+@cache_once
+def use_hgcc() -> bool:
+    """Compile JIT device sources with hgcc (SAIL) instead of nvcc/hipcc.
+
+    Defaults to whether the local runtime is SAIL, the same way
+    `is_hip_runtime()` selects hipcc; an explicitly set SGLANG_JIT_USE_HGCC
+    wins either way, so CI can cross-compile without SAIL hardware and SAIL
+    machines can fall back to the nvcc path.
+    """
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_JIT_USE_HGCC.is_set():
+        return envs.SGLANG_JIT_USE_HGCC.get()
+    return is_sail_runtime()
+
+
 _REGISTERED_CLASSES: Dict[type, type] = {}
 
 

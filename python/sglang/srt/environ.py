@@ -1279,6 +1279,16 @@ class Envs:
     # Drop the GB/s and TFLOPS columns from the benchmark marker's table.
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH = EnvBool(False)
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_FLOPS = EnvBool(False)
+    # Compile JIT device sources with hgcc (SAIL) instead of nvcc/hipcc. hgcc
+    # cannot read CUDA sources, so they are converted by sailify first.
+    # Unset follows SAIL runtime detection; set it to override that default,
+    # either to force hgcc on without SAIL hardware (cross-compile/CI) or to
+    # force it off on SAIL machines (nvcc fallback).
+    SGLANG_JIT_USE_HGCC = EnvBool(False)
+    # The hgcc --gpu-architecture target. One of: native, all, all-ppu,
+    # all-vm, ppu_10, ppu_15, vm_10, vm_15. "native" builds for the local
+    # device only, matching how the nvcc path pins -gencode to this GPU.
+    SGLANG_SAIL_GPU_ARCH = EnvStr("native")
 
     # ===================================================================
     # Expert-parallel dispatch and MoE execution

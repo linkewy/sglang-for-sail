@@ -25,6 +25,7 @@ from sglang.srt.platforms.mps import MpsSRTPlatform
 from sglang.srt.platforms.musa import MusaSRTPlatform
 from sglang.srt.platforms.npu import NPUSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
+from sglang.srt.platforms.sail import SailSRTPlatform, is_sail_available
 from sglang.srt.platforms.xpu import XpuSRTPlatform
 from sglang.srt.plugins import PLATFORM_PLUGINS_GROUP, load_plugins_by_group
 
@@ -146,6 +147,11 @@ def _resolve_platform() -> SRTPlatform:
         if _is_cpu_available():
             logger.debug("SGLANG_USE_CPU_ENGINE=1. Using CPU SRTPlatform defaults.")
             return CpuSRTPlatform()
+        if is_sail_available():
+            logger.debug(
+                "No platform plugin detected. Using SAIL SRTPlatform defaults."
+            )
+            return SailSRTPlatform()
         if _is_cuda_available():
             logger.debug(
                 "No platform plugin detected. Using CUDA SRTPlatform defaults."

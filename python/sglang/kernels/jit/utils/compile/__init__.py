@@ -4,7 +4,7 @@ The package owns the whole path from a ``load_jit`` call to a loaded module,
 including the ``build.ninja`` it compiles through — only tvm-ffi's headers,
 its shared library, and ``tvm_ffi.load_module`` are consumed from outside.
 
-Modules, in dependency order (there are no cycles)::
+Modules, in dependency order::
 
     paths      where the in-tree sources live, and the default flags
     cpp_args   rendering Python values as C++ template arguments
@@ -12,7 +12,12 @@ Modules, in dependency order (there are no cycles)::
     toolchain  compilers, tvm-ffi locations, platform base flags
     ninja      generating and running build.ninja, reading its depfiles
     cache      build_key / deps_key, cache layout, publication
+    sailify    CUDA -> PPU source conversion for hgcc builds
     loader     load_jit
+
+``sailify`` and ``cache`` reference each other lazily (the mirror digest uses
+the cache's file digests; the environment fingerprint uses the sailify
+version), so neither imports the other at module level.
 """
 
 from sglang.kernels.jit.utils.compile.cpp_args import (
