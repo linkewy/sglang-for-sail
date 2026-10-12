@@ -1,0 +1,83 @@
+name: Build SAIL Wheels
+
+on:
+  workflow_call:
+    inputs:
+      tested_sha:
+        type: string
+        required: true
+      build_image:
+        type: string
+        required: true
+    outputs:
+      manifest_sha256:
+        description: Manifest SHA256 of the shared wheel artifact built in this run
+        value: ${{ jobs.build.outputs.manifest_sha256 }}
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tested_sha }}
+          persist-credentials: false
+      - name: Shell and workflow contracts
+        run: |
+          bash -n scripts/ci/ppu/build_sail_wheels.sh
+          bash -n scripts/ci/ppu/run_sail_smoke.sh
+          shellcheck scripts/ci/ppu/build_sail_wheels.sh scripts/ci/ppu/run_sail_smoke.sh
+          docker run --rm -v "$GITHUB_WORKSPACE:/repo:ro" -w /repo rhysd/actionlint:1.7.7 \
+            -ignore 'label "k8s-runner-group-cpu-thead" is unknown' \
+            .github/workflows/pr-test-ppu.yml .github/workflows/_pr-test-ppu-build.yml .github/workflows/_pr-test-ppu-smoke.yml
+
+  build:
+    needs: lint
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ${{ inputs.build_image }}
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      manifest_sha256: ${{ steps.manifest.outputs.manifest_sha256 }}
+    env:
+      # The image's default index lacks build; provider/hash checks still apply.
+      PIP_INDEX_URL: https://pypi.org/simple
+      SAIL_TESTED_SHA: ${{ inputs.tested_sha }}
+      SAIL_BUILD_IMAGE: ${{ inputs.build_image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tested_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: CPU unit and import checks
+        run: |
+          python3 scripts/ci/ppu/prepare_sail_env.py tools --venv "$RUNNER_TEMP/ppu-checks"
+          "$RUNNER_TEMP/ppu-checks/bin/python3" -m unittest discover -s scripts/ci/ppu -p 'test_*.py'
+          "$RUNNER_TEMP/ppu-checks/bin/python3" -m compileall -q scripts/ci/ppu test/registered/ppu
+          PYTHONPATH=python "$RUNNER_TEMP/ppu-checks/bin/python3" test/registered/unit/test_sail_dispatch.py -v
+          PYTHONPATH=python "$RUNNER_TEMP/ppu-checks/bin/python3" test/registered/unit/multimodal/test_internvl_utils_import.py TestInternVLDependency -v
+      - name: Prepare Rust 1.92.0
+        uses: dtolnay/rust-toolchain@0be0c8e6607124ba7557736a4b6b5a8fe2b0c284
+      - name: Build and validate two wheels
+        run: bash scripts/ci/ppu/build_sail_wheels.sh "$RUNNER_TEMP/wheel-python3.12-sail"
+      - id: manifest
+        run: |
+          python3 scripts/ci/ppu/sail_wheel_manifest.py verify "$RUNNER_TEMP/wheel-python3.12-sail" \
+            --expected-sha "$SAIL_TESTED_SHA" --build-image "$SAIL_BUILD_IMAGE"
+          digest=$(sha256sum "$RUNNER_TEMP/wheel-python3.12-sail/manifest.json")
+          echo "manifest_sha256=${digest%% *}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-python3.12-sail
+          path: ${{ runner.temp }}/wheel-python3.12-sail/
+          retention-days: 3
+          if-no-files-found: error
+          overwrite: true

@@ -21,6 +21,11 @@ import torch
 _cache_buf: Dict[Tuple[str, torch.device], torch.Tensor] = {}
 
 
+@functools.lru_cache(maxsize=1)
+def is_sail() -> bool:
+    return torch.cuda.is_available() and "ZW" in torch.cuda.get_device_name()
+
+
 def _get_cache_buf(name: str, bytes: int, device: torch.device) -> torch.Tensor:
     key = (name, device)
     buf = _cache_buf.get(key)

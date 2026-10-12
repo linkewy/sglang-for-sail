@@ -1,0 +1,129 @@
+name: SAIL Registered Smoke
+
+on:
+  workflow_call:
+    inputs:
+      tested_sha:
+        type: string
+        required: true
+      build_image:
+        type: string
+        required: true
+      manifest_sha256:
+        type: string
+        required: true
+      board_selector:
+        type: string
+        required: true
+      expected_device_name:
+        type: string
+        required: true
+      model_path:
+        type: string
+        default: /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ${{ inputs.build_image }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      SAIL_TESTED_SHA: ${{ inputs.tested_sha }}
+      SAIL_BUILD_IMAGE: ${{ inputs.build_image }}
+      SAIL_MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+      SGLANG_PPU_EXPECTED_DEVICE_NAME: ${{ inputs.expected_device_name }}
+      SGLANG_PPU_SMOKE_MODEL: ${{ inputs.model_path }}
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 2
+        with:
+          ref: ${{ inputs.tested_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        timeout-minutes: 3
+        with:
+          name: wheel-python3.12-sail
+          path: wheel-python3.12-sail
+      - id: prepare
+        timeout-minutes: 3
+        env:
+          BOARD_SELECTOR: ${{ inputs.board_selector }}
+        run: |
+          [[ "$SAIL_TESTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SAIL_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$SGLANG_PPU_SMOKE_MODEL" =~ ^/nas_aisw/[A-Za-z0-9_/.-]+$ ]]
+          case "$SGLANG_PPU_EXPECTED_DEVICE_NAME:$BOARD_SELECTOR" in
+            ZW810E:board-type=OAM-810E|ZW-M890P:board-type=ZW-M890P) ;;
+            *) exit 1 ;;
+          esac
+          if git config --local --name-only --get-regexp 'http\..*\.extraheader'; then
+            echo 'Checkout credentials must not enter NAS staging' >&2
+            exit 1
+          fi
+          python3 scripts/ci/ppu/sail_wheel_manifest.py verify wheel-python3.12-sail \
+            --expected-sha "$SAIL_TESTED_SHA" --build-image "$SAIL_BUILD_IMAGE"
+          printf '%s  %s\n' "$SAIL_MANIFEST_SHA256" wheel-python3.12-sail/manifest.json | sha256sum --check --strict
+          echo "run_token=$(python3 -c 'import uuid; print(uuid.uuid4().hex)')" >> "$GITHUB_OUTPUT"
+      - id: observer
+        timeout-minutes: 1
+        env:
+          SAIL_SMOKE_RUN_TOKEN: ${{ steps.prepare.outputs.run_token }}
+          BOARD_SELECTOR: ${{ inputs.board_selector }}
+        run: |
+          export PATH="/opt/bin:$PATH"
+          command -v kubectl
+          kubectl auth can-i list pods --namespace default
+          nohup python3 scripts/ci/ppu/sail_smoke_checks.py observe \
+            --namespace default --selector "$BOARD_SELECTOR" --output "$RUNNER_TEMP/ppu-pod.json" \
+            > "$RUNNER_TEMP/ppu-observer.log" 2>&1 < /dev/null &
+          echo "pid=$!" >> "$GITHUB_OUTPUT"
+      - id: scheduler
+        timeout-minutes: 80
+        uses: t-head/ppu-scheduler-action@26ba21dbe66fb841192796ed990f8fd2c7997ecf
+        with:
+          image: ${{ inputs.build_image }}
+          command: bash scripts/ci/ppu/run_sail_smoke.sh
+          nnodes: 0
+          nproc_per_node: 1
+          namespace: default
+          node_selector: ${{ inputs.board_selector }}
+          timeout_minutes: 75
+          cleanup_policy: always
+          job_suffix: sglang-${{ inputs.expected_device_name }}
+          extra_env: SAIL_SMOKE_RUN_TOKEN=${{ steps.prepare.outputs.run_token }}
+      - name: Verify Pod evidence and cleanup
+        timeout-minutes: 2
+        env:
+          SAIL_SMOKE_RUN_TOKEN: ${{ steps.prepare.outputs.run_token }}
+          JOB_NAME: ${{ steps.scheduler.outputs.job_name }}
+          JOB_STATUS: ${{ steps.scheduler.outputs.job_status }}
+        run: |
+          export PATH="/opt/bin:$PATH"
+          [[ "$JOB_STATUS" == succeeded ]]
+          python3 scripts/ci/ppu/sail_smoke_checks.py receipt \
+            --namespace default --job "$JOB_NAME" --artifact wheel-python3.12-sail \
+            --result "$RUNNER_TEMP/ppu-pod.json" --output "$RUNNER_TEMP/$SGLANG_PPU_EXPECTED_DEVICE_NAME.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ppu-smoke-${{ inputs.expected_device_name }}-${{ github.run_attempt }}-receipt
+          path: ${{ runner.temp }}/${{ inputs.expected_device_name }}.json
+          retention-days: 3
+          if-no-files-found: error
+      - name: Stop observer
+        if: always()
+        env:
+          OBSERVER_PID: ${{ steps.observer.outputs.pid }}
+        run: |
+          if [[ "$OBSERVER_PID" =~ ^[0-9]+$ ]]; then
+            kill "$OBSERVER_PID" 2>/dev/null || true
+          fi
+          if [[ -f "$RUNNER_TEMP/ppu-observer.log" ]]; then
+            cat "$RUNNER_TEMP/ppu-observer.log"
+          fi

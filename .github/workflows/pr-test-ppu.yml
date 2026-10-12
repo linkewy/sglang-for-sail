@@ -2,168 +2,176 @@ name: PR Test (PPU)
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
     types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
+      ref:
+        description: Git ref to test; leave empty to use the triggering commit
+        type: string
+        default: ''
       run_all_tests:
-        description: "Run the preflight even if the last commit touched no PPU path"
-        required: false
+        description: Ignore path filters and run smoke tests on both board types
         type: boolean
         default: true
   workflow_call:
     inputs:
       ref:
-        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
-        required: false
         type: string
         default: ''
       run_all_tests:
-        description: "Run all tests (for releasing or testing purpose)"
-        required: false
         type: boolean
         default: false
 
+permissions:
+  contents: read
+  pull-requests: read
+
 concurrency:
-  # Newer runs cancel older runs for the same ref; unrelated label events
-  # use isolated groups to avoid interfering with active runs.
   group: >-
     pr-test-ppu-${{
-      (github.event_name == 'pull_request' &&
-       github.event.action == 'labeled' &&
-       github.event.label.name != 'run-ci' &&
-       github.event.label.name != 'run-ci-ppu') &&
-      format('ignored-label-{0}', github.run_id) ||
-      inputs.ref || github.ref
+      (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
+       github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
+      format('ignored-label-{0}', github.run_id) || inputs.ref || github.ref
     }}
   cancel-in-progress: true
 
 jobs:
-  # ==================== Check Changes ==================== #
   check-changes:
-    # Give skipped checks from unrelated labels distinct names so they cannot
-    # replace the corresponding checks from an active run.
     name: >-
       ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
            github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
           'ignored-label-check-changes' || 'check-changes' }}
-    if: |
-      github.event_name != 'pull_request' ||
-      github.event.action != 'labeled' ||
-      github.event.label.name == 'run-ci' ||
-      github.event.label.name == 'run-ci-ppu'
+    if: >-
+      github.event_name != 'pull_request' || github.event.action != 'labeled' ||
+      github.event.label.name == 'run-ci' || github.event.label.name == 'run-ci-ppu'
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read
     outputs:
-      # Scope only; the shared pr-gate checks both required labels.
-      ppu: ${{ steps.filter.outputs.ppu == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+      ppu: ${{ steps.filter.outputs.ppu == 'true' || inputs.run_all_tests == true }}
+      tested_sha: ${{ steps.identity.outputs.tested_sha }}
+      build_image: ${{ steps.identity.outputs.build_image }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          # github.sha (not github.ref) so a runner that dequeues after main
-          # advances still validates the SHA that triggered the run.
-          ref: ${{ inputs.ref || github.sha }}
-
-      - name: Determine run mode
-        id: run-mode
+          ref: ${{ github.event_name == 'pull_request' && github.sha || inputs.ref || github.sha }}
+          persist-credentials: false
+      - id: identity
         run: |
-          if [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
-            echo "run_all_tests=true" >> "$GITHUB_OUTPUT"
-            echo "Run mode: ALL TESTS"
-          else
-            echo "run_all_tests=false" >> "$GITHUB_OUTPUT"
-            echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
-          fi
-
-      - name: Detect file changes
-        id: filter
+          echo "tested_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo 'build_image=download.t-head.cn/docker_release/pytorch@sha256:a33a67832f7ec442c481421e94255518dd67e464406f8e610c15d2b594b21f80' >> "$GITHUB_OUTPUT"
+      - id: filter
+        if: inputs.run_all_tests != true
         uses: dorny/paths-filter@v3
-        if: steps.run-mode.outputs.run_all_tests != 'true'
         with:
-          # PPU-specific paths only.
           filters: |
             ppu:
-              - ".github/workflows/pr-test-ppu.yml"
-              - "scripts/ci/ppu/**"
-              - "python/sglang/srt/platforms/ppu.py"
-              - "python/sglang/srt/hardware_backend/ppu/**"
-              - "python/sglang/kernels/aot/csrc/ppu/**"
+              - '.github/workflows/pr-test-ppu.yml'
+              - '.github/workflows/_pr-test-ppu-*.yml'
+              - '.github/workflows/pr-gate.yml'
+              - 'python/**'
+              - 'rust/**'
+              - 'scripts/release/**'
+              - 'scripts/ci/ppu/**'
+              - 'test/run_suite.py'
+              - 'test/registered/ppu/**'
+              - 'test/registered/unit/test_sail_dispatch.py'
+              - 'test/registered/unit/multimodal/test_internvl_utils_import.py'
+              - 'CMakeLists.txt'
+              - 'pyproject.toml'
+              - 'setup.cfg'
+              - 'MANIFEST.in'
+              - 'README.md'
+              - 'LICENSE'
+              - 'docs/docs/hardware-platforms/sail.mdx'
 
-  # ==================== PR Gate ==================== #
   pr-gate:
-    name: >-
-      ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
-           github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
-          'ignored-label-pr-gate' || 'pr-gate' }}
     needs: check-changes
     if: needs.check-changes.outputs.ppu == 'true'
     uses: ./.github/workflows/pr-gate.yml
     with:
       require-run-ci: true
       require-label: run-ci-ppu
-    secrets: inherit
 
-  # ==================== PPU Runner Preflight ==================== #
-  # Validates the runner contract only; the SRT platform and AOT kernels land
-  # in later PRs and build their first real test on top of this job.
-  ppu-preflight:
-    name: >-
-      ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
-           github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
-          'ignored-label-ppu-preflight' || 'ppu-preflight' }}
+  ppu-wheel-build:
     needs: [check-changes, pr-gate]
-    if: needs.check-changes.outputs.ppu == 'true'
-    runs-on: 1-ppu-m890p
-    timeout-minutes: 60
-    env:
-      SGLANG_IS_IN_CI: true
-    steps:
-      - name: Checkout code
-        timeout-minutes: 10
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.sha }}
+    if: needs.check-changes.outputs.ppu == 'true' && needs.pr-gate.result == 'success'
+    uses: ./.github/workflows/_pr-test-ppu-build.yml
+    with:
+      tested_sha: ${{ needs.check-changes.outputs.tested_sha }}
+      build_image: ${{ needs.check-changes.outputs.build_image }}
 
-      - name: Validate PPU runner contract
-        timeout-minutes: 10
-        run: python3 scripts/ci/ppu/check_ppu_environment.py
+  ppu-smoke:
+    needs: [check-changes, ppu-wheel-build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - board_selector: board-type=OAM-810E
+            expected_device_name: ZW810E
+          - board_selector: board-type=ZW-M890P
+            expected_device_name: ZW-M890P
+    uses: ./.github/workflows/_pr-test-ppu-smoke.yml
+    with:
+      tested_sha: ${{ needs.check-changes.outputs.tested_sha }}
+      build_image: ${{ needs.check-changes.outputs.build_image }}
+      manifest_sha256: ${{ needs.ppu-wheel-build.outputs.manifest_sha256 }}
+      board_selector: ${{ matrix.board_selector }}
+      expected_device_name: ${{ matrix.expected_device_name }}
 
-  # ==================== Finish ==================== #
   pr-test-ppu-finish:
     name: >-
       ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
            github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
           'ignored-label-pr-test-ppu-finish' || 'pr-test-ppu-finish' }}
-    needs: [pr-gate, check-changes, ppu-preflight]
+    needs: [check-changes, pr-gate, ppu-wheel-build, ppu-smoke]
     if: always() && needs.check-changes.result != 'skipped'
     runs-on: ubuntu-latest
     steps:
-      - name: Check all dependent job statuses
+      - id: statuses
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
-          json_needs='${{ toJson(needs) }}'
-          for job in $(echo "$json_needs" | jq -r 'keys_unsorted[]'); do
-            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
-            echo "$job: $result"
-            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
-              echo "The above jobs failed."
-              exit 1
-            fi
-          done
-          echo "All jobs completed successfully"
-
-      - name: Require the preflight when PPU is in scope
+          python3 - <<'PY'
+          import json, os
+          needs = json.loads(os.environ['NEEDS_JSON'])
+          check = needs['check-changes']
+          if check['result'] != 'success':
+              raise SystemExit('Change detection failed')
+          scope = check['outputs'].get('ppu')
+          if scope not in ('true', 'false'):
+              raise SystemExit('Missing scope decision')
+          expected = 'success' if scope == 'true' else 'skipped'
+          for job in ('pr-gate', 'ppu-wheel-build', 'ppu-smoke'):
+              if needs[job]['result'] != expected:
+                  raise SystemExit(f'{job}: expected {expected}, got {needs[job]["result"]}')
+          PY
+      - uses: actions/download-artifact@v4
+        if: needs.check-changes.outputs.ppu == 'true'
+        with:
+          pattern: ppu-smoke-*-${{ github.run_attempt }}-receipt
+          path: ppu-receipts
+          merge-multiple: true
+      - id: receipts
+        if: needs.check-changes.outputs.ppu == 'true'
+        env:
+          TESTED_SHA: ${{ needs.check-changes.outputs.tested_sha }}
+          BUILD_IMAGE: ${{ needs.check-changes.outputs.build_image }}
+          MANIFEST_SHA256: ${{ needs.ppu-wheel-build.outputs.manifest_sha256 }}
+          RECEIPT_ROOT: ppu-receipts
         run: |
-          in_scope='${{ needs.check-changes.outputs.ppu }}'
-          preflight='${{ needs.ppu-preflight.result }}'
-          echo "PPU in scope: '$in_scope' / ppu-preflight: '$preflight'"
-
-          if [[ "$in_scope" == "true" && "$preflight" != "success" ]]; then
-            echo "PPU was in scope but ppu-preflight did not succeed."
-            exit 1
-          fi
-          echo "Preflight status is consistent with the requested scope."
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['RECEIPT_ROOT'])
+          boards = {'ZW810E', 'ZW-M890P'}
+          if not root.is_dir() or {p.name for p in root.iterdir()} != {b + '.json' for b in boards}:
+              raise SystemExit('Both board receipts from this attempt are required')
+          for board in boards:
+              receipt = json.loads((root / (board + '.json')).read_text())
+              expected = dict(git_sha=os.environ['TESTED_SHA'], build_image=os.environ['BUILD_IMAGE'],
+                              manifest_sha256=os.environ['MANIFEST_SHA256'], expected_device=board)
+              if any(receipt.get(k) != v for k, v in expected.items()):
+                  raise SystemExit('Board receipt identity mismatch')
+          PY

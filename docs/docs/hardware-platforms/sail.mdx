@@ -57,6 +57,133 @@ python3 -m sglang.launch_server \
 When the server displays `The server is fired up and ready to roll!`, startup is
 successful.
 
+## CI Wheel Builds and Dual-Board Smoke Tests
+
+### Pinned Build Environment
+
+CI uses Linux x86_64, CPython 3.12, and the SAIL SDK 2.2.0 / vendor PyTorch 2.13 image:
+
+```text
+Original tag: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-hggcrt3-py312-20261005
+Pinned reference: download.t-head.cn/docker_release/pytorch@sha256:a33a67832f7ec442c481421e94255518dd67e464406f8e610c15d2b594b21f80
+```
+
+The image includes Python, hgcc, git, timeout, and setsid, but not Rust/Cargo. CI uses
+`dtolnay/rust-toolchain@0be0c8e6607124ba7557736a4b6b5a8fe2b0c284` to install Rust 1.92.0.
+Manual builds also require a working rustup installation. Builds require access to
+GitHub, the Rust distribution service, and Python wheel sources.
+The image's default Python index does not provide `build`, so CI explicitly uses
+`https://pypi.org/simple`. Python dependencies remain subject to protected-provider,
+wheel URL, and SHA256 checks. Smoke tests replay the artifact's dependency lock
+without resolving dependencies against an index again.
+
+Inside a CPU container using this image, run the following from the root of a clean,
+committed checkout with complete history and tags:
+
+```bash Command
+export SAIL_TESTED_SHA="$(git rev-parse HEAD)"
+export SAIL_BUILD_IMAGE='download.t-head.cn/docker_release/pytorch@sha256:a33a67832f7ec442c481421e94255518dd67e464406f8e610c15d2b594b21f80'
+export SGL_KERNEL_COMPILE_THREADS=16
+export PIP_INDEX_URL=https://pypi.org/simple
+bash scripts/ci/ppu/build_sail_wheels.sh /tmp/wheel-python3.12-sail
+```
+
+The output directory must not already exist. The script rejects uncommitted changes,
+shallow clones, and mismatched SHAs. It exports all Python/Rust build inputs with
+`git archive` without modifying the checkout. It pins sailify to revision
+`f401ecae76d7b4991d44920bde9edaac7e655fd8`, sets
+`PYTORCH_SAIL_ARCH="ppu_10;ppu_15"`, and validates the hgcc architecture flags.
+
+The single `wheel-python3.12-sail` artifact contains:
+
+- One SGLang wheel, including the multimodal Rust extension.
+- One `sglang-kernel` wheel, including `common_ops` for both architectures.
+- `runtime-deps.lock.json`, `manifest.json`, and `SHA256SUMS`.
+
+Both wheels use the `cp312-cp312-linux_x86_64` tag; they do not claim Python 3.10/3.11
+ABI compatibility. CPU installation validation uses a fresh `--system-site-packages`
+venv, protects vendor torch/triton and their actual provider distributions, and
+rejects replacements or NVIDIA runtime packages. Third-party dependencies are
+installed only as binary wheels from prevalidated URLs and hashes. Validation then
+runs `pip check`, checks installation paths and native hashes, and loads the actual
+Rust extension. Dependency conflicts block the build.
+
+### Registered Smoke Tests
+
+After the shared authorization gate passes, `pr-test-ppu.yml` builds the wheels once.
+810E and M890P consume the same SHA, image digest, and artifact. Both boards must pass;
+missing, skipped, cancelled, or failed runs cannot pass the gate.
+
+The test registers with
+`register_ppu_ci(est_time=300, stage="stage-a", runner_config="1-gpu-ppu")`
+in `stage-a-test-1-gpu-ppu` and contains two required cases:
+
+- Validate the real device and the source/hash of `common_ops`, then compare four norm
+  operations and top-k/top-p renormalization against reference results on a real PPU.
+- Start a local Qwen3-0.6B server, call `/generate`, and verify HTTP 200, nonempty text,
+  and completion tokens > 0.
+
+These conservative launch options apply only to this smoke test and do not change
+platform-wide defaults:
+
+```text
+--attention-backend triton
+--sampling-backend pytorch
+--cuda-graph-backend-prefill disabled
+--cuda-graph-backend-decode disabled
+```
+
+To reproduce locally, extract the CI artifact into `wheel-python3.12-sail/` at the
+root of a checkout of the same commit. In a single-PPU container using the matching
+image, set the SHA/image variables above and the following variables, then run the
+wrapper:
+
+```bash Command
+export SAIL_MANIFEST_SHA256="$(sha256sum wheel-python3.12-sail/manifest.json | cut -d' ' -f1)"
+export SAIL_SMOKE_RUN_TOKEN="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+export SGLANG_PPU_EXPECTED_DEVICE_NAME=ZW810E
+export SGLANG_PPU_SMOKE_MODEL=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B
+bash scripts/ci/ppu/run_sail_smoke.sh
+```
+
+For M890P, use `SGLANG_PPU_EXPECTED_DEVICE_NAME=ZW-M890P`. Computing the hash from the
+artifact is only for local reproduction; CI must obtain the expected manifest hash
+from the build job's independent output.
+The wrapper replays the lock, validates registration, launches the suite, and checks
+result identity and cleanup. It neither rebuilds wheels nor retries tests.
+Environment preparation is limited to 900 seconds, the suite to 2100 seconds, server
+readiness to 600 seconds, and HTTP requests to 120 seconds. The build job is limited
+to 120 minutes and each smoke job to 90 minutes. The scheduler's 75-minute limit
+covers both queueing and execution.
+
+### Deployment Prerequisites and Validation Scope
+
+- The CPU self-hosted runner `k8s-runner-group-cpu-thead` must support explicit job
+  containers, provide kubectl at `/opt/bin/kubectl` or on PATH, and use a restricted
+  namespace/RBAC configuration.
+- The scheduler action is pinned to revision `26ba21dbe66fb841192796ed990f8fd2c7997ecf`.
+  Single-device mode uses `nnodes=0` and `nproc_per_node=1`, with selectors
+  `board-type=OAM-810E` and `board-type=ZW-M890P`, respectively.
+- The current namespace is `default`. Before deployment, verify job/NAS isolation,
+  model readability, and that scheduling credentials cannot enter the workspace or
+  automatically forwarded job environment. Never place an unrestricted kubeconfig
+  in the synchronized directory.
+- During scheduling, the CPU observer records the Pod's `imageID` using this run's
+  token. After success, it must confirm that the Pod has been deleted. Each board
+  uploads a completion receipt for the current `run_attempt`; the finish job checks
+  that both receipts have matching identities.
+- Select **Re-run all jobs** when retrying. Rerunning only failed jobs may leave the
+  current attempt without the other board's receipt; the finish job rejects results
+  from earlier attempts.
+- Maintainers must configure `pr-test-ppu-finish` as a required check and verify
+  process/Pod cleanup after failures, cancellations, and timeouts.
+
+CPU contract tests do not replace builds in the pinned image or real-device
+validation. Before merging, obtain results for the same artifact on both boards,
+regression results for affected CUDA/ROCm paths, and evidence of platform isolation
+and cleanup. This smoke test covers single-device functionality only; it does not
+certify multi-device support, performance, or accuracy.
+
 ## Verify
 
 You can send an OpenAI-compatible request to the engine:

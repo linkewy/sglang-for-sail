@@ -2,9 +2,19 @@
 import math
 
 import torch
-import torchvision.transforms as T
 from PIL import Image
-from torchvision.transforms.functional import InterpolationMode
+
+
+def _load_torchvision_transforms():
+    try:
+        import torchvision.transforms as T
+        from torchvision.transforms.functional import InterpolationMode
+    except (ImportError, RuntimeError) as exc:
+        raise RuntimeError(
+            "InternVL image preprocessing requires a torchvision build compatible with the installed PyTorch"
+        ) from exc
+    return T, InterpolationMode
+
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -16,6 +26,7 @@ def build_transform(
     mean: tuple[float, float, float],
     std: tuple[float, float, float],
 ):
+    T, InterpolationMode = _load_torchvision_transforms()
     transform = T.Compose(
         [
             T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
@@ -193,6 +204,7 @@ def dynamic_resize_image(
     )
     image = image.convert("RGB")
     image = image.resize((target_w, target_h), Image.BICUBIC)
+    T, InterpolationMode = _load_torchvision_transforms()
     transform = T.Compose(
         [
             T.ToTensor(),
@@ -217,6 +229,7 @@ def resize_image_to_pixels(
     """
     image = image.convert("RGB")
     image = image.resize((target_w, target_h), Image.BICUBIC)
+    T, InterpolationMode = _load_torchvision_transforms()
     transform = T.Compose(
         [
             T.ToTensor(),
@@ -344,6 +357,7 @@ def video_to_pixel_values(
 
     frame = frame.convert("RGB")
     frame = frame.resize((target_w, target_h), Image.BICUBIC)
+    T, InterpolationMode = _load_torchvision_transforms()
     transform = T.Compose(
         [
             T.ToTensor(),

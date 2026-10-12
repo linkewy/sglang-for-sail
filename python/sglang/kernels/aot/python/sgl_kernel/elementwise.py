@@ -1,7 +1,8 @@
 from typing import Optional
 
 import torch
-from sgl_kernel.utils import is_arch_support_pdl
+
+from sgl_kernel.utils import is_arch_support_pdl, is_sail
 
 try:
     import flashinfer.norm as _flashinfer_norm
@@ -116,6 +117,7 @@ def rmsnorm(
         _has_flashinfer
         and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
         and not torch.compiler.is_dynamo_compiling()
+        and not is_sail()
     ):
         return _flashinfer_norm.rmsnorm(input, weight, eps, out, enable_pdl)
     else:
@@ -156,6 +158,7 @@ def fused_add_rmsnorm(
         _has_flashinfer
         and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
         and not torch.compiler.is_dynamo_compiling()
+        and not is_sail()
     ):
         _flashinfer_norm.fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
     else:
@@ -197,6 +200,7 @@ def gemma_rmsnorm(
         _has_flashinfer
         and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
         and not torch.compiler.is_dynamo_compiling()
+        and not is_sail()
     ):
         return _flashinfer_norm.gemma_rmsnorm(input, weight, eps, out, enable_pdl)
     else:
@@ -237,6 +241,7 @@ def gemma_fused_add_rmsnorm(
         _has_flashinfer
         and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
         and not torch.compiler.is_dynamo_compiling()
+        and not is_sail()
     ):
         _flashinfer_norm.gemma_fused_add_rmsnorm(
             input, residual, weight, eps, enable_pdl

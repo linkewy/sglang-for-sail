@@ -541,5 +541,4 @@ setup(
     package_dir=_package_dir,
     ext_modules=ext_modules,
     cmdclass={"build_ext": _CustomBuildExt.with_options(use_ninja=True)},
-    options={"bdist_wheel": {"py_limited_api": "cp310"}},
 )
