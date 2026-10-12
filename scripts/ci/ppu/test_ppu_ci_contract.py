@@ -303,6 +303,49 @@ class TestWorkflowContract(unittest.TestCase):
         build = self.load("_pr-test-ppu-build.yml")["jobs"]["build"]
         self.assertEqual(build["env"].get("PIP_INDEX_URL"), "https://pypi.org/simple")
 
+    def test_build_trusts_only_the_mounted_checkout(self):
+        import os
+        import tempfile
+
+        build = self.load("_pr-test-ppu-build.yml")["jobs"]["build"]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            checkout = root / "checkout"
+            other = root / "other"
+            env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+            env.update(
+                HOME=str(root),
+                GIT_CONFIG_NOSYSTEM="1",
+                GIT_CONFIG_GLOBAL=str(root / "absent-global-config"),
+            )
+            for repo in (checkout, other):
+                subprocess.run(["git", "init", "-q", str(repo)], env=env, check=True)
+            env["GIT_TEST_ASSUME_DIFFERENT_OWNER"] = "1"
+
+            def check(repo, settings):
+                return subprocess.run(
+                    ["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
+                    env=settings,
+                    capture_output=True,
+                    text=True,
+                )
+
+            self.assertIn("dubious ownership", check(checkout, env).stderr)
+            scoped = dict(env)
+            scoped.update(
+                {
+                    key: value.replace("${{ github.workspace }}", str(checkout))
+                    for key, value in build["env"].items()
+                    if key.startswith("GIT_CONFIG_")
+                }
+            )
+            result = check(checkout, scoped)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), str(checkout))
+            self.assertIn("dubious ownership", check(other, scoped).stderr)
+            self.assertIn("dubious ownership", check(checkout, env).stderr)
+            self.assertFalse((root / "absent-global-config").exists())
+
     def test_hosted_build_resource_contract(self):
         build = self.load("_pr-test-ppu-build.yml")["jobs"]["build"]
         self.assertEqual(build["runs-on"], "ubuntu-24.04")
