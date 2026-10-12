@@ -303,6 +303,19 @@ class TestWorkflowContract(unittest.TestCase):
         build = self.load("_pr-test-ppu-build.yml")["jobs"]["build"]
         self.assertEqual(build["env"].get("PIP_INDEX_URL"), "https://pypi.org/simple")
 
+    def test_hosted_build_resource_contract(self):
+        build = self.load("_pr-test-ppu-build.yml")["jobs"]["build"]
+        self.assertEqual(build["runs-on"], "ubuntu-24.04")
+        self.assertEqual(build["container"]["image"], "${{ inputs.build_image }}")
+        self.assertEqual(build["env"].get("SGL_KERNEL_COMPILE_THREADS"), "2")
+        self.assertEqual(build["env"].get("CARGO_BUILD_JOBS"), "2")
+        diagnostics = next(s for s in build["steps"] if s.get("id") == "resources")
+        for command in ("uname -m", "nproc", "free -h", "df -h"):
+            self.assertIn(command, diagnostics["run"])
+        self.assertFalse(
+            any("ppu-scheduler-action" in s.get("uses", "") for s in build["steps"])
+        )
+
     def test_workflow_topology_and_credentials(self):
         main = self.load("pr-test-ppu.yml")["jobs"]
         self.assertIn("ppu-wheel-build", main)
@@ -323,7 +336,12 @@ class TestWorkflowContract(unittest.TestCase):
                     self.assertEqual(job["runs-on"], "ubuntu-latest")
                     self.assertEqual(jobs["build"]["needs"], "lint")
                 else:
-                    self.assertEqual(job["runs-on"], "k8s-runner-group-cpu-thead")
+                    expected_runner = (
+                        "ubuntu-24.04"
+                        if job_name == "build"
+                        else "k8s-runner-group-cpu-thead"
+                    )
+                    self.assertEqual(job["runs-on"], expected_runner)
                     self.assertIn("container", job)
                 self.assertNotIn("continue-on-error", job)
                 for step in job["steps"]:

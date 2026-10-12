@@ -37,7 +37,7 @@ jobs:
 
   build:
     needs: lint
-    runs-on: k8s-runner-group-cpu-thead
+    runs-on: ubuntu-24.04
     container:
       image: ${{ inputs.build_image }}
     timeout-minutes: 120
@@ -51,7 +51,16 @@ jobs:
       PIP_INDEX_URL: https://pypi.org/simple
       SAIL_TESTED_SHA: ${{ inputs.tested_sha }}
       SAIL_BUILD_IMAGE: ${{ inputs.build_image }}
+      SGL_KERNEL_COMPILE_THREADS: '2'
+      CARGO_BUILD_JOBS: '2'
     steps:
+      - name: Build runner resources
+        id: resources
+        run: |
+          uname -m
+          nproc
+          free -h
+          df -h / /tmp
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tested_sha }}
