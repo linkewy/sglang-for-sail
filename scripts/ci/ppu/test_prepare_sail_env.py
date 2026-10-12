@@ -32,6 +32,32 @@ class TestPrepareEnvironment(unittest.TestCase):
             },
         }
 
+    def test_runtime_resolver_includes_image_protobuf_consumers(self):
+        import ast
+
+        tree = ast.parse(TOOL.read_text())
+        runtime_call = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "resolve_install"
+            and isinstance(node.args[1], ast.List)
+            and any(
+                isinstance(item, ast.Constant) and item.value == "sgl-eval==0.1.2"
+                for item in node.args[1].elts
+            )
+        )
+        requirements = {
+            item.value
+            for item in runtime_call.args[1].elts
+            if isinstance(item, ast.Constant)
+        }
+        self.assertTrue(
+            {"google-api-core", "googleapis-common-protos"} <= requirements,
+            "Resolve the image's protobuf consumers together with the runtime",
+        )
+
     def test_accept_binary_plan(self):
         result = self.tool.validate_plan(
             {"install": [self.entry()]}, self.protected, {}
