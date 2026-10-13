@@ -781,6 +781,7 @@ class TestPrepareEnvironment(unittest.TestCase):
                 normalize.assert_called_once_with(before)
                 self.assertEqual(resolve.call_args.kwargs.get("exclusions"), policy)
                 self.assertIn("tabulate", resolve.call_args.args[1])
+                self.assertIn("pyarrow<26", resolve.call_args.args[1])
                 vision = self.vision_record()
                 self.assertIn(
                     f"torchvision @ {vision['url']}#sha256={vision['sha256']}",

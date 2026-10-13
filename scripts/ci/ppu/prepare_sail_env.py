@@ -571,6 +571,7 @@ def prepare(mode, prefix, artifact=None):
                     "pytest",
                     "PyYAML",
                     "tabulate",
+                    "pyarrow<26",
                 ],
                 before,
                 projects,
