@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -120,25 +121,44 @@ def pod_evidence(pods, token, image, selector):
 
 def observe_pod(output, namespace, selector):
     deadline = time.monotonic() + 80 * 60
+    failures = 0
     while time.monotonic() < deadline:
-        response = subprocess.run(
-            [
-                "kubectl",
-                "get",
-                "pods",
-                "-n",
-                namespace,
-                "-l",
-                "app.kubernetes.io/managed-by=ppu-distributed-action",
-                "-o",
-                "json",
-                "--request-timeout=15s",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=20,
-            check=True,
-        )
+        try:
+            response = subprocess.run(
+                [
+                    "kubectl",
+                    "get",
+                    "pods",
+                    "-n",
+                    namespace,
+                    "-l",
+                    "app.kubernetes.io/managed-by=ppu-distributed-action",
+                    "-o",
+                    "json",
+                    "--request-timeout=15s",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=True,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            failures += 1
+            detail = exc.stderr or str(exc)
+            if isinstance(detail, bytes):
+                detail = detail.decode("utf-8", errors="replace")
+            print(
+                f"Pod query failed ({failures}/3): {detail[-4096:].strip()}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if failures >= 3:
+                raise RuntimeError(
+                    "Pod observer stopped after 3 consecutive query failures"
+                ) from exc
+            time.sleep(5)
+            continue
+        failures = 0
         evidence = pod_evidence(
             json.loads(response.stdout)["items"],
             os.environ["SAIL_SMOKE_RUN_TOKEN"],

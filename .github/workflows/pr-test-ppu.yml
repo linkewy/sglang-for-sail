@@ -96,6 +96,7 @@ jobs:
                   '.github/workflows/_pr-test-ppu-smoke.yml',
                   'scripts/ci/ppu/prepare_sail_env.py',
                   'scripts/ci/ppu/run_sail_smoke.sh',
+                  'scripts/ci/ppu/sail_smoke_checks.py',
                   'scripts/ci/ppu/test_prepare_sail_env.py',
                   'scripts/ci/ppu/test_ppu_ci_contract.py',
                   'docs/docs/hardware-platforms/sail.mdx',

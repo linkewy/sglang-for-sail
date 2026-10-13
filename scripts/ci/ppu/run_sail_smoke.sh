@@ -13,7 +13,7 @@ export SAIL_ARTIFACT_DIR="$repo/wheel-python3.12-sail"
 [[ -d "$SGLANG_PPU_SMOKE_MODEL" && -f "$SGLANG_PPU_SMOKE_MODEL/config.json" ]]
 export SAIL_VALIDATION_SHA="${SAIL_VALIDATION_SHA:-$SAIL_TESTED_SHA}"
 [[ "$SAIL_VALIDATION_SHA" =~ ^[0-9a-f]{40}$ ]]
-[[ $(git -C "$repo" rev-parse HEAD) == "$SAIL_VALIDATION_SHA" ]]
+[[ $(git -c "safe.directory=$repo" -C "$repo" rev-parse HEAD) == "$SAIL_VALIDATION_SHA" ]]
 unset PYTHONPATH PYTHONHOME VIRTUAL_ENV HF_HUB_OFFLINE TRANSFORMERS_OFFLINE
 export PYTHONNOUSERSITE=1 SGLANG_TEST_MAX_RETRY=0 HF_HUB_OFFLINE=0 SGLANG_IS_IN_CI=1
 work=$(mktemp -d "${TMPDIR:-/tmp}/sglang-ppu-smoke.XXXXXXXX")

@@ -291,6 +291,109 @@ class TestSmokeChecks(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.tool.pod_evidence([pod], "new-run", image, "board-type=ZW-M890P")
 
+    def test_observer_recovers_from_query_errors_without_losing_diagnostics(self):
+        import contextlib
+        import io
+        import json
+        import os
+        import tempfile
+        from unittest.mock import patch
+
+        image = "example.org/sdk@sha256:" + "a" * 64
+        pod = {
+            "metadata": {
+                "name": "worker-0",
+                "uid": "uid",
+                "namespace": "default",
+                "labels": {"ppu-job": "job"},
+            },
+            "spec": {
+                "nodeSelector": {"board-type": "OAM-810E"},
+                "containers": [
+                    {
+                        "name": "worker",
+                        "image": image,
+                        "env": [{"name": "SAIL_SMOKE_RUN_TOKEN", "value": "new-run"}],
+                    }
+                ],
+            },
+            "status": {"containerStatuses": [{"name": "worker", "imageID": image}]},
+        }
+        success = subprocess.CompletedProcess(
+            ["kubectl"], 0, json.dumps({"items": [pod]})
+        )
+        errors = [
+            subprocess.CalledProcessError(
+                1, ["kubectl"], stderr="API connection closed"
+            ),
+            subprocess.TimeoutExpired(["kubectl"], 20, stderr=b"API request timed out"),
+        ]
+        for error in errors:
+            with (
+                self.subTest(error=type(error).__name__),
+                tempfile.TemporaryDirectory() as temp,
+                patch.dict(
+                    os.environ, SAIL_SMOKE_RUN_TOKEN="new-run", SAIL_BUILD_IMAGE=image
+                ),
+                patch.object(
+                    self.tool.subprocess, "run", side_effect=[error, success]
+                ) as run,
+                patch.object(self.tool.time, "sleep") as sleep,
+                contextlib.redirect_stderr(io.StringIO()) as diagnostic,
+            ):
+                output = Path(temp) / "pod.json"
+                self.tool.observe_pod(output, "default", "board-type=OAM-810E")
+                self.assertEqual(json.loads(output.read_text())["uid"], "uid")
+                self.assertEqual(run.call_count, 2)
+                sleep.assert_called_once_with(5)
+                self.assertIn("API", diagnostic.getvalue())
+                self.assertIn("1/3", diagnostic.getvalue())
+
+    def test_observer_stops_after_three_query_failures_without_evidence(self):
+        import contextlib
+        import io
+        import tempfile
+        from unittest.mock import patch
+
+        error = subprocess.CalledProcessError(1, ["kubectl"], stderr="API unavailable")
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch.object(self.tool.subprocess, "run", side_effect=error) as run,
+            patch.object(self.tool.time, "sleep") as sleep,
+            contextlib.redirect_stderr(io.StringIO()) as diagnostic,
+        ):
+            output = Path(temp) / "pod.json"
+            with self.assertRaisesRegex(RuntimeError, "3 consecutive"):
+                self.tool.observe_pod(output, "default", "board-type=OAM-810E")
+            self.assertEqual(run.call_count, 3)
+            self.assertEqual(sleep.call_count, 2)
+            self.assertFalse(output.exists())
+            self.assertIn("API unavailable", diagnostic.getvalue())
+
+    def test_observer_does_not_retry_invalid_pod_data(self):
+        import os
+        import tempfile
+        from unittest.mock import patch
+
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch.dict(
+                os.environ, SAIL_SMOKE_RUN_TOKEN="new-run", SAIL_BUILD_IMAGE="image"
+            ),
+            patch.object(
+                self.tool.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(["kubectl"], 0, "not JSON"),
+            ) as run,
+            patch.object(self.tool.time, "sleep") as sleep,
+        ):
+            output = Path(temp) / "pod.json"
+            with self.assertRaises(ValueError):
+                self.tool.observe_pod(output, "default", "board-type=OAM-810E")
+            run.assert_called_once()
+            sleep.assert_not_called()
+            self.assertFalse(output.exists())
+
 
 class TestWorkflowContract(unittest.TestCase):
     def load(self, name):
@@ -542,10 +645,28 @@ const github = {rest: {actions: {
             ):
                 with self.subTest(override=override):
                     self.assertNotEqual(execute(dict(env, **override)).returncode, 0)
-            (root / "source.py").write_text("changed\n")
-            git("add", "source.py")
-            git("commit", "-qm", "source change")
-            self.assertNotEqual(execute(env).returncode, 0)
+            (helper.parent / "sail_smoke_checks.py").write_text("observer fix\n")
+            git("add", "scripts")
+            git("commit", "-qm", "observer fix")
+            result = execute(env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for path in (
+                "source.py",
+                "python/sglang/runtime.py",
+                "rust/src/lib.rs",
+                "scripts/ci/ppu/build_sail_wheels.sh",
+                "test/registered/ppu/test_sail_qwen3_smoke.py",
+            ):
+                base = git("rev-parse", "HEAD")
+                changed = root / path
+                changed.parent.mkdir(parents=True, exist_ok=True)
+                changed.write_text("changed\n")
+                git("add", path)
+                git("commit", "-qm", "source or build change")
+                result = execute(dict(env, TESTED_REF=base))
+                with self.subTest(path=path):
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("require recompilation", result.stderr)
             normal = dict(
                 env,
                 REUSE_BUILD_RUN_ID="",
@@ -553,6 +674,87 @@ const github = {rest: {actions: {
                 EVENT_NAME="pull_request",
             )
             self.assertEqual(execute(normal).returncode, 0)
+
+    def test_smoke_git_trust_is_command_scoped_and_checks_sha(self):
+        import os
+        import tempfile
+
+        source = (TOOLS / "run_sail_smoke.sh").read_text()
+        start = source.index("export SAIL_VALIDATION_SHA=")
+        end = source.index("unset PYTHONPATH", start)
+        script = 'repo="$1"\n' + source[start:end]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            checkout, other = root / "checkout", root / "other"
+            env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+            env.update(
+                HOME=str(root),
+                GIT_CONFIG_NOSYSTEM="1",
+                GIT_CONFIG_GLOBAL=str(root / "absent-global-config"),
+                GIT_AUTHOR_NAME="Test",
+                GIT_AUTHOR_EMAIL="test@example.org",
+                GIT_COMMITTER_NAME="Test",
+                GIT_COMMITTER_EMAIL="test@example.org",
+            )
+            for repo in (checkout, other):
+                subprocess.run(["git", "init", "-q", str(repo)], env=env, check=True)
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(repo),
+                        "commit",
+                        "--allow-empty",
+                        "-qm",
+                        "baseline",
+                    ],
+                    env=env,
+                    check=True,
+                )
+            sha = subprocess.check_output(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD"], env=env, text=True
+            ).strip()
+            env.update(
+                SAIL_TESTED_SHA=sha,
+                SAIL_VALIDATION_SHA=sha,
+                GIT_TEST_ASSUME_DIFFERENT_OWNER="1",
+            )
+
+            def execute(code, settings):
+                return subprocess.run(
+                    ["bash", "-e", "-c", code, "smoke-test", str(checkout), str(other)],
+                    env=settings,
+                    capture_output=True,
+                    text=True,
+                )
+
+            self.assertIn(
+                "dubious ownership", execute('git -C "$1" rev-parse HEAD', env).stderr
+            )
+            result = execute(script, env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotEqual(
+                execute(script, dict(env, SAIL_VALIDATION_SHA="a" * 40)).returncode, 0
+            )
+            result = execute(script + '\ngit -C "$2" rev-parse HEAD', env)
+            self.assertIn("dubious ownership", result.stderr)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "dubious ownership", execute('git -C "$1" rev-parse HEAD', env).stderr
+            )
+            self.assertFalse((root / "absent-global-config").exists())
+
+    def test_observer_preflight_queries_the_same_pods(self):
+        observer = next(
+            s
+            for s in self.load("_pr-test-ppu-smoke.yml")["jobs"]["smoke"]["steps"]
+            if s.get("id") == "observer"
+        )
+        commands = observer["run"]
+        self.assertIn("kubectl get pods", commands)
+        self.assertIn("app.kubernetes.io/managed-by=ppu-distributed-action", commands)
+        self.assertIn("--request-timeout=15s", commands)
+        self.assertLess(commands.index("kubectl get pods"), commands.index("nohup"))
 
     def test_build_uses_explicit_public_dependency_index(self):
         build = self.load("_pr-test-ppu-build.yml")["jobs"]["build"]
