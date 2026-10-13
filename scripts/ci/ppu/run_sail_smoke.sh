@@ -11,7 +11,9 @@ repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 export SAIL_ARTIFACT_DIR="$repo/wheel-python3.12-sail"
 [[ "$SGLANG_PPU_EXPECTED_DEVICE_NAME" == ZW810E || "$SGLANG_PPU_EXPECTED_DEVICE_NAME" == ZW-M890P ]]
 [[ -d "$SGLANG_PPU_SMOKE_MODEL" && -f "$SGLANG_PPU_SMOKE_MODEL/config.json" ]]
-[[ $(git -C "$repo" rev-parse HEAD) == "$SAIL_TESTED_SHA" ]]
+export SAIL_VALIDATION_SHA="${SAIL_VALIDATION_SHA:-$SAIL_TESTED_SHA}"
+[[ "$SAIL_VALIDATION_SHA" =~ ^[0-9a-f]{40}$ ]]
+[[ $(git -C "$repo" rev-parse HEAD) == "$SAIL_VALIDATION_SHA" ]]
 unset PYTHONPATH PYTHONHOME VIRTUAL_ENV HF_HUB_OFFLINE TRANSFORMERS_OFFLINE
 export PYTHONNOUSERSITE=1 SGLANG_TEST_MAX_RETRY=0 HF_HUB_OFFLINE=0 SGLANG_IS_IN_CI=1
 work=$(mktemp -d "${TMPDIR:-/tmp}/sglang-ppu-smoke.XXXXXXXX")

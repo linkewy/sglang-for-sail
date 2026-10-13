@@ -685,6 +685,8 @@ class TestPrepareEnvironment(unittest.TestCase):
                     SAIL_ALLOW_IMAGE_CLEANUP="1",
                     SAIL_BUILD_IMAGE=self.tool.CI_CLEANUP_IMAGE,
                     SAIL_TESTED_SHA="a" * 40,
+                    SAIL_VALIDATION_SHA="b" * 40,
+                    SAIL_BUILD_RUN_ID="123",
                     SAIL_BUILD_MANIFEST_SHA256=digest,
                     KUBERNETES_SERVICE_HOST="test-cluster",
                 )
@@ -735,6 +737,9 @@ class TestPrepareEnvironment(unittest.TestCase):
                 )
                 self.assertEqual(validated["wheels"], built["wheels"])
                 self.assertEqual(validated["build_manifest_sha256"], digest)
+                self.assertEqual(validated.get("validation_sha"), "b" * 40)
+                self.assertEqual(validated.get("build_run_id"), "123")
+                self.assertEqual(validated["git_sha"], "a" * 40)
                 lock = json.loads((artifact / "runtime-deps.lock.json").read_text())
                 self.assertEqual(lock["image_exclusions"], policy)
                 self.assertNotIn("cloud-tpu-client", lock["inherited"])
@@ -762,6 +767,22 @@ class TestPrepareEnvironment(unittest.TestCase):
                 install.assert_called_once()
                 self.assertEqual(install.call_args.args[1], [self.vision_record()])
                 self.assertEqual(lock["wheels"], [self.vision_record()])
+                for validation_sha in ("c" * 40, "invalid"):
+                    with (
+                        self.subTest(validation_sha=validation_sha),
+                        patch.dict(
+                            os.environ,
+                            dict(env, SAIL_VALIDATION_SHA=validation_sha),
+                            clear=True,
+                        ),
+                        patch.object(self.tool, "snapshot_using", return_value=before),
+                        patch.object(self.tool, "normalize_ci_image") as normalize,
+                        patch.object(self.tool, "run") as rejected,
+                        self.assertRaisesRegex(ValueError, "[Vv]alidation"),
+                    ):
+                        self.tool.prepare("replay", root / "rejected", artifact)
+                    normalize.assert_not_called()
+                    rejected.assert_not_called()
                 self.assertTrue(
                     any(
                         list(c.args[0])[-2:] == ["pip", "check"]
@@ -897,6 +918,93 @@ class TestPrepareEnvironment(unittest.TestCase):
                         "version": "1.0",
                     },
                 )
+
+    def test_downloader_identifies_client_and_checks_wheel(self):
+        import hashlib
+        import io
+        import zipfile
+        from contextlib import redirect_stdout
+        from unittest.mock import patch
+        from urllib.request import Request
+
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr(
+                "numpy-1.0.dist-info/METADATA", "Name: numpy\nVersion: 1.0\n"
+            )
+        payload = buffer.getvalue()
+        record = {
+            "name": "numpy",
+            "version": "1.0",
+            "url": "https://example.org/numpy-1.0-py3-none-any.whl",
+            "filename": "numpy-1.0-py3-none-any.whl",
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+
+        def open_wheel(request, timeout):
+            self.assertIsInstance(request, Request)
+            self.assertEqual(request.full_url, record["url"])
+            self.assertEqual(request.get_header("User-agent"), "sglang-sail-ci/1.0")
+            self.assertEqual(timeout, 120)
+            response = io.BytesIO(payload)
+            response.url = record["url"]
+            return response
+
+        for valid in (True, False):
+            with (
+                self.subTest(valid_hash=valid),
+                tempfile.TemporaryDirectory() as temp,
+                patch.object(self.tool, "urlopen", side_effect=open_wheel),
+                patch.object(self.tool, "run") as install,
+                redirect_stdout(io.StringIO()) as output,
+            ):
+                candidate = dict(record, sha256=record["sha256"] if valid else "a" * 64)
+                if valid:
+                    self.tool.install_locked(
+                        "python", [candidate], Path(temp), self.protected
+                    )
+                    install.assert_called_once_with(
+                        [
+                            "python",
+                            "-m",
+                            "pip",
+                            "install",
+                            "--no-index",
+                            "--no-deps",
+                            Path(temp) / record["filename"],
+                        ]
+                    )
+                    self.assertIn(record["name"], output.getvalue())
+                    self.assertIn(record["url"], output.getvalue())
+                else:
+                    with self.assertRaisesRegex(ValueError, "hash mismatch"):
+                        self.tool.install_locked(
+                            "python", [candidate], Path(temp), self.protected
+                        )
+                    install.assert_not_called()
+
+    def test_download_error_identifies_safe_dependency_without_installing(self):
+        import io
+        from contextlib import redirect_stdout
+        from unittest.mock import patch
+        from urllib.error import HTTPError
+
+        record = self.vision_record()
+        error = HTTPError(record["url"], 403, "Forbidden", {}, None)
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch.object(self.tool, "urlopen", side_effect=error) as download,
+            patch.object(self.tool, "run") as install,
+            redirect_stdout(io.StringIO()),
+        ):
+            with self.assertRaises(Exception) as caught:
+                self.tool.install_locked("python", [record], Path(temp), self.protected)
+            self.assertIsInstance(caught.exception, RuntimeError)
+            self.assertRegex(str(caught.exception), "torchvision.*HTTP 403")
+            self.assertIn(record["url"], str(caught.exception))
+            download.assert_called_once()
+            install.assert_not_called()
+            self.assertEqual(list(Path(temp).iterdir()), [])
 
     def test_install_preflights_entire_lock(self):
         from unittest.mock import patch

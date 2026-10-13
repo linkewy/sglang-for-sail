@@ -14,8 +14,9 @@ import tempfile
 import zipfile
 from email.parser import BytesParser
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import unquote, urlsplit
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 import tomllib
 from sail_wheel_manifest import (
@@ -327,12 +328,24 @@ def verify_download(path, record):
 def install_locked(python, entries, cache, protected):
     validate_locked(entries, protected)
     files = []
-    for record in entries:
+    for index, record in enumerate(entries, 1):
         path = cache / basename(record["filename"])
-        with urlopen(record["url"], timeout=120) as response:
-            safe_url(response.url)
-            with path.open("xb") as dest:
-                shutil.copyfileobj(response, dest)
+        print(
+            f"Downloading dependency {index}/{len(entries)}: "
+            f"{record['name']} {record['url']}",
+            flush=True,
+        )
+        request = Request(record["url"], headers={"User-Agent": "sglang-sail-ci/1.0"})
+        try:
+            with urlopen(request, timeout=120) as response:
+                safe_url(response.url)
+                with path.open("xb") as dest:
+                    shutil.copyfileobj(response, dest)
+        except HTTPError as exc:
+            raise RuntimeError(
+                f"Dependency {record['name']} download failed: HTTP {exc.code}; "
+                f"URL: {record['url']}"
+            ) from None
         verify_download(path, record)
         files.append(path)
     if files:
@@ -453,6 +466,13 @@ def prepare(mode, prefix, artifact=None):
             os.environ.get("SAIL_BUILD_IMAGE", ""),
             stage="build" if mode == "resolve" else "runtime",
         )
+        validation_sha = os.environ.get("SAIL_VALIDATION_SHA", document["git_sha"])
+        require(re.fullmatch(r"[0-9a-f]{40}", validation_sha), "Invalid validation SHA")
+        if mode == "replay":
+            require(
+                document.get("validation_sha", document["git_sha"]) == validation_sha,
+                "Validation SHA differs from the runtime artifact",
+            )
         manifest_digest = sha256(artifact / "manifest.json")
         if mode == "resolve":
             require(
@@ -601,7 +621,13 @@ def prepare(mode, prefix, artifact=None):
             )
             lock_path.write_text(json.dumps(lock, indent=2, sort_keys=True) + "\n")
             create_artifact(
-                artifact, dict(document, build_manifest_sha256=manifest_digest)
+                artifact,
+                dict(
+                    document,
+                    build_manifest_sha256=manifest_digest,
+                    validation_sha=validation_sha,
+                    build_run_id=os.environ.get("SAIL_BUILD_RUN_ID", ""),
+                ),
             )
 
 

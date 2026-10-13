@@ -340,6 +340,222 @@ class TestWorkflowContract(unittest.TestCase):
         scheduler = next(s for s in smoke["steps"] if s.get("id") == "scheduler")
         self.assertIn("SAIL_ALLOW_IMAGE_CLEANUP=1", scheduler["with"]["extra_env"])
 
+    def test_manual_reuse_skips_compilation_and_pins_source(self):
+        main = self.load("pr-test-ppu.yml")
+        inputs = main[True]["workflow_dispatch"]["inputs"]
+        for key in ("reuse_build_run_id", "reuse_build_manifest_sha256"):
+            self.assertIn(key, inputs)
+            self.assertEqual(inputs[key]["default"], "")
+            self.assertNotIn(key, main[True]["workflow_call"]["inputs"])
+        build = self.load("_pr-test-ppu-build.yml")
+        self.assertEqual(build["permissions"]["actions"], "read")
+        steps = build["jobs"]["build"]["steps"]
+        for step in steps:
+            if "build_sail_wheels.sh" in step.get(
+                "run", ""
+            ) or "rust-toolchain@" in step.get("uses", ""):
+                self.assertEqual(step.get("if"), "inputs.reuse_build_run_id == ''")
+        download = next(s for s in steps if s.get("id") == "reuse_download")
+        self.assertEqual(download["if"], "inputs.reuse_build_run_id != ''")
+        self.assertEqual(download["with"]["run-id"], "${{ inputs.reuse_build_run_id }}")
+        self.assertEqual(
+            download["with"]["artifact-ids"], "${{ steps.reuse.outputs.artifact_id }}"
+        )
+        self.assertEqual(download["with"]["github-token"], "${{ github.token }}")
+        self.assertIs(download["with"].get("merge-multiple"), True)
+        manifest = next(s for s in steps if s.get("id") == "manifest")
+        self.assertIn('"$REUSE_BUILD_MANIFEST_SHA256"', manifest["run"])
+        for name in ("ppu-wheel-build", "ppu-smoke"):
+            self.assertEqual(
+                main["jobs"][name]["with"]["validation_sha"],
+                "${{ needs.check-changes.outputs.validation_sha }}",
+            )
+        smoke = self.load("_pr-test-ppu-smoke.yml")["jobs"]["smoke"]
+        self.assertEqual(
+            smoke["env"]["SAIL_VALIDATION_SHA"],
+            "${{ inputs.validation_sha || inputs.tested_sha }}",
+        )
+        self.assertIn(
+            "SAIL_VALIDATION_SHA=",
+            next(s for s in smoke["steps"] if s.get("id") == "scheduler")["with"][
+                "extra_env"
+            ],
+        )
+        self.assertIn(
+            "${SAIL_VALIDATION_SHA:-$SAIL_TESTED_SHA}",
+            (TOOLS / "run_sail_smoke.sh").read_text(),
+        )
+
+    def test_reuse_source_rejects_wrong_run_artifact_or_missing_compilation(self):
+        import copy
+        import json
+        import os
+
+        steps = self.load("_pr-test-ppu-build.yml")["jobs"]["build"]["steps"]
+        self.assertTrue(
+            any(s.get("id") == "reuse" for s in steps), "reuse preflight is missing"
+        )
+        script = next(s for s in steps if s.get("id") == "reuse")["with"]["script"]
+        import shutil
+
+        node = shutil.which("node") or next(
+            (
+                str(p)
+                for p in (Path("/__e/node24/bin/node"), Path("/__e/node20/bin/node"))
+                if p.is_file()
+            ),
+            None,
+        )
+        self.assertIsNotNone(node, "GitHub Actions Node runtime is required")
+        data = {
+            "run": {
+                "id": 123,
+                "status": "completed",
+                "head_sha": "a" * 40,
+                "path": ".github/workflows/pr-test-ppu.yml",
+                "repository": {"full_name": "owner/repo"},
+                "head_repository": {"full_name": "owner/repo"},
+            },
+            "artifacts": [
+                {"id": 456, "name": "wheel-python3.12-sail-build", "expired": False}
+            ],
+            "jobs": [
+                {
+                    "name": "ppu-wheel-build / build",
+                    "conclusion": "success",
+                    "steps": [
+                        {
+                            "name": "Compile and validate two wheels without runtime dependencies",
+                            "conclusion": "success",
+                        }
+                    ],
+                }
+            ],
+        }
+        cases = [("valid", data)]
+        for field, value in (
+            ("head_sha", "b" * 40),
+            ("status", "in_progress"),
+            ("path", "other.yml"),
+            ("head_repository", {"full_name": "other/repo"}),
+        ):
+            bad = copy.deepcopy(data)
+            bad["run"][field] = value
+            cases.append((field, bad))
+        for field, value in (("expired", True), ("name", "wheel-python3.12-sail")):
+            bad = copy.deepcopy(data)
+            bad["artifacts"][0][field] = value
+            cases.append((field, bad))
+        for value in ("failure", "skipped"):
+            bad = copy.deepcopy(data)
+            bad["jobs"][0]["steps"][0]["conclusion"] = value
+            cases.append((value, bad))
+        for name, records in cases:
+            env = dict(
+                os.environ,
+                REUSE_BUILD_RUN_ID="123",
+                SAIL_TESTED_SHA="a" * 40,
+                FIXTURE=json.dumps(records),
+            )
+            harness = """
+const fixture = JSON.parse(process.env.FIXTURE);
+const context = {repo: {owner: 'owner', repo: 'repo'}, eventName: 'workflow_dispatch'};
+const core = {setOutput: (key, value) => console.log(JSON.stringify({[key]: value}))};
+const github = {rest: {actions: {
+  getWorkflowRun: async () => ({data: fixture.run}),
+  listWorkflowRunArtifacts: async () => ({data: {artifacts: fixture.artifacts}}),
+  listJobsForWorkflowRun: async () => ({data: {jobs: fixture.jobs}}),
+}}};
+(async () => {
+""" + script + "\n})().catch(e => {console.error(e.message); process.exitCode = 1;});"
+            with self.subTest(case=name):
+                result = subprocess.run(
+                    [node, "-e", harness], env=env, capture_output=True, text=True
+                )
+                if name == "valid":
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn('"artifact_id":456', result.stdout)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+
+    def test_reuse_identity_rejects_source_changes_and_nonmanual_events(self):
+        import os
+        import tempfile
+
+        steps = self.load("pr-test-ppu.yml")["jobs"]["check-changes"]["steps"]
+        step = next(s for s in steps if s.get("id") == "identity")
+        self.assertIn("REUSE_BUILD_RUN_ID", step.get("env", {}))
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            env = dict(
+                os.environ,
+                GIT_AUTHOR_NAME="Test",
+                GIT_AUTHOR_EMAIL="test@example.org",
+                GIT_COMMITTER_NAME="Test",
+                GIT_COMMITTER_EMAIL="test@example.org",
+                GITHUB_OUTPUT=str(root / "output"),
+                REUSE_BUILD_RUN_ID="123",
+                REUSE_BUILD_MANIFEST_SHA256="c" * 64,
+                EVENT_NAME="workflow_dispatch",
+            )
+
+            def git(*args):
+                return subprocess.run(
+                    ["git", *args],
+                    cwd=root,
+                    env=env,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+
+            git("init", "-q")
+            (root / "source.py").write_text("original\n")
+            git("add", ".")
+            git("commit", "-qm", "baseline")
+            built = git("rev-parse", "HEAD")
+            helper = root / "scripts/ci/ppu/prepare_sail_env.py"
+            helper.parent.mkdir(parents=True)
+            helper.write_text("fixed\n")
+            git("add", "scripts")
+            git("commit", "-qm", "download fix")
+            validation = git("rev-parse", "HEAD")
+            env["TESTED_REF"] = built
+
+            def execute(settings):
+                return subprocess.run(
+                    ["bash", "-e", "-c", step["run"]],
+                    cwd=root,
+                    env=settings,
+                    capture_output=True,
+                    text=True,
+                )
+
+            result = execute(env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = (root / "output").read_text()
+            self.assertIn(f"tested_sha={built}", output)
+            self.assertIn(f"validation_sha={validation}", output)
+            for override in (
+                {"EVENT_NAME": "pull_request"},
+                {"TESTED_REF": "main"},
+                {"REUSE_BUILD_MANIFEST_SHA256": "bad"},
+                {"REUSE_BUILD_RUN_ID": "-1"},
+            ):
+                with self.subTest(override=override):
+                    self.assertNotEqual(execute(dict(env, **override)).returncode, 0)
+            (root / "source.py").write_text("changed\n")
+            git("add", "source.py")
+            git("commit", "-qm", "source change")
+            self.assertNotEqual(execute(env).returncode, 0)
+            normal = dict(
+                env,
+                REUSE_BUILD_RUN_ID="",
+                REUSE_BUILD_MANIFEST_SHA256="",
+                EVENT_NAME="pull_request",
+            )
+            self.assertEqual(execute(normal).returncode, 0)
+
     def test_build_uses_explicit_public_dependency_index(self):
         build = self.load("_pr-test-ppu-build.yml")["jobs"]["build"]
         self.assertEqual(build["env"].get("PIP_INDEX_URL"), "https://pypi.org/simple")
@@ -432,7 +648,8 @@ class TestWorkflowContract(unittest.TestCase):
                     if step.get("uses") == "actions/checkout@v4":
                         self.assertIs(step["with"]["persist-credentials"], False)
                         self.assertEqual(
-                            step["with"]["ref"], "${{ inputs.tested_sha }}"
+                            step["with"]["ref"],
+                            "${{ inputs.validation_sha || inputs.tested_sha }}",
                         )
         build = self.load("_pr-test-ppu-build.yml")["jobs"]["build"]
         self.assertEqual(build["timeout-minutes"], 120)

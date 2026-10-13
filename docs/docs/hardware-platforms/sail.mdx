@@ -159,6 +159,34 @@ expected hash from the downloaded file is for local reproduction; CI takes it fr
 the build job output. Dependency conflicts fail runtime validation and the overall
 CI gate, but do not discard the separately uploaded build artifact.
 
+### Manual Retry with Existing Wheels
+
+For a dependency-download or validation-script fix, `workflow_dispatch` can reuse
+an existing `wheel-python3.12-sail-build` artifact without invoking Rust or kernel
+compilation. Select the branch containing the fixed workflows and provide:
+
+- `ref`: the original wheel source commit, as a full SHA.
+- `reuse_build_run_id`: the run that successfully compiled those wheels.
+- `reuse_build_manifest_sha256`: the independently verified original manifest hash.
+- `run_all_tests`: `true` to run both board types.
+
+Reuse is manual-only. CI checks the source repository, run, successful compilation,
+artifact expiry, original manifest hash, wheel hashes, and pinned image. Only the
+explicitly listed CI validation/workflow files and this document may differ from
+the original commit; package sources, build scripts, and registered smoke tests
+must remain unchanged. Any other change requires a fresh build.
+
+The original wheel `git_sha` and bytes are preserved. The runtime manifest records
+`validation_sha` for the fixed scripts and `build_run_id` for the original build;
+both smoke environments require the matching validation SHA. Runtime validation
+and both board tests execute again, and only a successful runtime job publishes
+the final artifact. Regular PR/push runs continue to compile normally.
+
+Dependency downloads identify the client as `sglang-sail-ci/1.0`; some wheel CDNs
+reject the default Python urllib User-Agent. Download logs include the dependency
+name and credential-free URL, and HTTP failures retain the status code. This does
+not relax URL, hash, archive, or protected-provider checks.
+
 ### Registered Smoke Tests
 
 After the shared authorization gate passes, `pr-test-ppu.yml` builds the wheels once.

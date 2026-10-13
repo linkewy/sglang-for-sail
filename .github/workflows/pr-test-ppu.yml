@@ -12,6 +12,14 @@ on:
         description: Git ref to test; leave empty to use the triggering commit
         type: string
         default: ''
+      reuse_build_run_id:
+        description: Optional original build run ID; requires ref as its full SHA and a manifest hash
+        type: string
+        default: ''
+      reuse_build_manifest_sha256:
+        description: Verified original build manifest SHA256 for manual artifact reuse
+        type: string
+        default: ''
       run_all_tests:
         description: Ignore path filters and run smoke tests on both board types
         type: boolean
@@ -27,6 +35,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
   pull-requests: read
 
 concurrency:
@@ -49,20 +58,60 @@ jobs:
       github.event.label.name == 'run-ci' || github.event.label.name == 'run-ci-ppu'
     runs-on: ubuntu-latest
     outputs:
-      ppu: ${{ steps.filter.outputs.ppu == 'true' || inputs.run_all_tests == true }}
+      ppu: ${{ steps.filter.outputs.ppu == 'true' || inputs.run_all_tests == true || inputs.reuse_build_run_id != '' }}
       tested_sha: ${{ steps.identity.outputs.tested_sha }}
+      validation_sha: ${{ steps.identity.outputs.validation_sha }}
       build_image: ${{ steps.identity.outputs.build_image }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.sha || inputs.ref || github.sha }}
+          ref: ${{ (github.event_name == 'pull_request' || inputs.reuse_build_run_id != '') && github.sha || inputs.ref || github.sha }}
+          fetch-depth: 0
           persist-credentials: false
       - id: identity
+        env:
+          TESTED_REF: ${{ inputs.ref }}
+          REUSE_BUILD_RUN_ID: ${{ inputs.reuse_build_run_id }}
+          REUSE_BUILD_MANIFEST_SHA256: ${{ inputs.reuse_build_manifest_sha256 }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          echo "tested_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY'
+          import os, re, subprocess
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          validation = git('rev-parse', 'HEAD')
+          tested = validation
+          run_id = os.environ['REUSE_BUILD_RUN_ID']
+          digest = os.environ['REUSE_BUILD_MANIFEST_SHA256']
+          if run_id:
+              if (os.environ['EVENT_NAME'] != 'workflow_dispatch'
+                      or not re.fullmatch(r'[1-9][0-9]*', run_id)
+                      or not re.fullmatch(r'[0-9a-f]{64}', digest)
+                      or not re.fullmatch(r'[0-9a-f]{40}', os.environ['TESTED_REF'])):
+                  raise SystemExit('Reuse requires a manual run, full source SHA, run ID and manifest hash')
+              tested = git('rev-parse', '--verify', os.environ['TESTED_REF'] + '^{commit}')
+              allowed = {
+                  '.github/workflows/pr-test-ppu.yml',
+                  '.github/workflows/_pr-test-ppu-build.yml',
+                  '.github/workflows/_pr-test-ppu-smoke.yml',
+                  'scripts/ci/ppu/prepare_sail_env.py',
+                  'scripts/ci/ppu/run_sail_smoke.sh',
+                  'scripts/ci/ppu/test_prepare_sail_env.py',
+                  'scripts/ci/ppu/test_ppu_ci_contract.py',
+                  'docs/docs/hardware-platforms/sail.mdx',
+              }
+              changed = set(git('diff', '--name-only', tested, validation).splitlines())
+              if changed - allowed:
+                  raise SystemExit('Source/build/test changes require recompilation: ' + ', '.join(sorted(changed - allowed)))
+          elif digest:
+              raise SystemExit('A reuse manifest hash requires a source run ID')
+          print(f'Wheel source SHA: {tested}; validation SHA: {validation}; source build run: {run_id or "current"}')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'tested_sha={tested}\nvalidation_sha={validation}\n')
+          PY
           echo 'build_image=download.t-head.cn/docker_release/pytorch@sha256:a33a67832f7ec442c481421e94255518dd67e464406f8e610c15d2b594b21f80' >> "$GITHUB_OUTPUT"
       - id: filter
-        if: inputs.run_all_tests != true
+        if: inputs.run_all_tests != true && inputs.reuse_build_run_id == ''
         uses: dorny/paths-filter@v3
         with:
           filters: |
@@ -100,7 +149,10 @@ jobs:
     uses: ./.github/workflows/_pr-test-ppu-build.yml
     with:
       tested_sha: ${{ needs.check-changes.outputs.tested_sha }}
+      validation_sha: ${{ needs.check-changes.outputs.validation_sha }}
       build_image: ${{ needs.check-changes.outputs.build_image }}
+      reuse_build_run_id: ${{ inputs.reuse_build_run_id || '' }}
+      reuse_build_manifest_sha256: ${{ inputs.reuse_build_manifest_sha256 || '' }}
 
   ppu-smoke:
     needs: [check-changes, ppu-wheel-build]
@@ -115,6 +167,7 @@ jobs:
     uses: ./.github/workflows/_pr-test-ppu-smoke.yml
     with:
       tested_sha: ${{ needs.check-changes.outputs.tested_sha }}
+      validation_sha: ${{ needs.check-changes.outputs.validation_sha }}
       build_image: ${{ needs.check-changes.outputs.build_image }}
       manifest_sha256: ${{ needs.ppu-wheel-build.outputs.manifest_sha256 }}
       board_selector: ${{ matrix.board_selector }}
