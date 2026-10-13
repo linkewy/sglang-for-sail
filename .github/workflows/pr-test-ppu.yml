@@ -110,7 +110,7 @@ jobs:
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write(f'tested_sha={tested}\nvalidation_sha={validation}\n')
           PY
-          echo 'build_image=download.t-head.cn/docker_release/pytorch@sha256:a33a67832f7ec442c481421e94255518dd67e464406f8e610c15d2b594b21f80' >> "$GITHUB_OUTPUT"
+          echo 'build_image=reg.docker.alibaba-inc.com/ai-tmp/llm@sha256:70c5c0a2468d8a0258dbd32caa88aef989dd02d4e0dd37e1ef0fca344788b1bf' >> "$GITHUB_OUTPUT"
       - id: filter
         if: inputs.run_all_tests != true && inputs.reuse_build_run_id == ''
         uses: dorny/paths-filter@v3

@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import tomllib
 import zipfile
 from email.parser import BytesParser
 from pathlib import Path
@@ -19,28 +20,35 @@ from urllib.error import HTTPError
 from urllib.parse import unquote, urlsplit
 from urllib.request import Request, urlopen
 
-import tomllib
 from sail_wheel_manifest import (
     PROJECTS,
     basename,
     canonical,
-    create as create_artifact,
+)
+from sail_wheel_manifest import create as create_artifact
+from sail_wheel_manifest import (
     inspect_wheel,
     read_json,
     require,
     sha256,
-    verify as verify_artifact,
 )
+from sail_wheel_manifest import verify as verify_artifact
 
-PROTECTED = {"torch", "triton", "torch-for-sail", "triton-for-sail"}
-FORBIDDEN_RUNTIME_MODULES = {
+IMAGE_RUNTIME_MODULES = {
     "flashinfer-python": "flashinfer",
     "cuda-python": "cuda",
     "nvidia-ml-py": "pynvml",
 }
+PROTECTED = {
+    "torch",
+    "triton",
+    "torch-for-sail",
+    "triton-for-sail",
+    *IMAGE_RUNTIME_MODULES,
+}
 CI_CLEANUP_IMAGE = (
-    "download.t-head.cn/docker_release/pytorch@sha256:"
-    "a33a67832f7ec442c481421e94255518dd67e464406f8e610c15d2b594b21f80"
+    "reg.docker.alibaba-inc.com/ai-tmp/llm@sha256:"
+    "70c5c0a2468d8a0258dbd32caa88aef989dd02d4e0dd37e1ef0fca344788b1bf"
 )
 CI_IMAGE_EXCLUSIONS = {"cloud-tpu-client": "0.10"}
 CPU_TORCHVISION = {
@@ -68,37 +76,35 @@ def run(command, **kwargs):
     )
 
 
-def inspect_forbidden_runtime(installed):
-    distributions = sorted(set(installed).intersection(FORBIDDEN_RUNTIME_MODULES))
+def inspect_image_runtime(installed):
+    missing_distributions = sorted(set(IMAGE_RUNTIME_MODULES) - set(installed))
+    require(
+        not missing_distributions,
+        "Required image runtime distributions missing: "
+        + ", ".join(missing_distributions),
+    )
     modules = {}
-    for module in FORBIDDEN_RUNTIME_MODULES.values():
+    for module in IMAGE_RUNTIME_MODULES.values():
         spec = importlib.util.find_spec(module)
-        if spec is None:
-            modules[module] = None
-        elif spec.origin is not None:
+        require(spec is not None, f"Required image runtime module missing: {module}")
+        if spec.origin is not None:
             modules[module] = str(Path(spec.origin).resolve())
         else:
             locations = spec.submodule_search_locations or ()
             modules[module] = ",".join(str(Path(path).resolve()) for path in locations)
-            if not modules[module]:
-                modules[module] = "<unknown>"
-    require(
-        not distributions,
-        "Forbidden runtime distributions installed: " + ", ".join(distributions),
-    )
-    importable = {name: path for name, path in modules.items() if path is not None}
-    require(
-        not importable,
-        "Forbidden runtime modules importable: "
-        + ", ".join(f"{name}={path}" for name, path in importable.items()),
-    )
-    return {"distributions": distributions, "modules": modules}
+            require(
+                modules[module], f"Required image runtime module has no path: {module}"
+            )
+    return {
+        "distributions": {name: installed[name] for name in IMAGE_RUNTIME_MODULES},
+        "modules": modules,
+    }
 
 
-def report_forbidden_runtime(label, state):
-    evidence = state["forbidden_runtime"]
+def report_image_runtime(label, state):
     print(
-        f"No-three-package check {label}: " + json.dumps(evidence, sort_keys=True),
+        f"Image runtime check {label}: "
+        + json.dumps(state["image_runtime"], sort_keys=True),
         flush=True,
     )
 
@@ -114,7 +120,7 @@ def snapshot():
                 "version": dist.version,
                 "path": str(Path(dist.locate_file("")).resolve()),
             }
-    forbidden_runtime = inspect_forbidden_runtime(installed)
+    image_runtime = inspect_image_runtime(installed)
     providers = metadata.packages_distributions()
     modules = {}
     for name in ("torch", "triton"):
@@ -137,7 +143,7 @@ def snapshot():
     return {
         "installed": installed,
         "requirements": requirements,
-        "forbidden_runtime": forbidden_runtime,
+        "image_runtime": image_runtime,
         "protected": {
             "modules": modules,
             "distributions": {
@@ -154,7 +160,11 @@ def snapshot_using(python):
 
 
 def compare_protected(before, after):
-    require(before == after, "Vendor torch/triton distribution or import path changed")
+    require(before == after, "Protected image distribution or import path changed")
+
+
+def compare_image_runtime(before, after):
+    require(before == after, "Image runtime distribution or import path changed")
 
 
 def ci_image_exclusions():
@@ -229,6 +239,7 @@ def normalize_ci_image(before):
         run([sys.executable, "-m", "pip", "uninstall", "--yes", *sorted(plan)])
         after = snapshot_using(sys.executable)
         compare_protected(before["protected"], after["protected"])
+        compare_image_runtime(before["image_runtime"], after["image_runtime"])
         for field in ("installed", "requirements"):
             expected = {k: v for k, v in before[field].items() if k not in plan}
             require(
@@ -258,9 +269,7 @@ def safe_url(url):
 
 
 def validate_plan(report, protected, projects):
-    forbidden = (
-        PROTECTED | set(protected["distributions"]) | set(FORBIDDEN_RUNTIME_MODULES)
-    )
+    forbidden = PROTECTED | set(protected["distributions"])
     entries = []
     seen = set()
     for item in report["install"]:
@@ -297,12 +306,7 @@ def validate_plan(report, protected, projects):
 
 
 def validate_locked(entries, protected):
-    forbidden = (
-        PROTECTED
-        | PROJECTS
-        | set(protected["distributions"])
-        | set(FORBIDDEN_RUNTIME_MODULES)
-    )
+    forbidden = PROTECTED | PROJECTS | set(protected["distributions"])
     require(isinstance(entries, list), "Locked dependencies must be a list")
     names, filenames = set(), set()
     for record in entries:
@@ -430,7 +434,9 @@ def resolve_install(python, requirements, before, projects, work, exclusions=Non
     policy = exclusions or {}
     validate_image_exclusions(policy, policy, {r["name"] for r in entries})
     install_locked(python, entries, work, before["protected"])
-    compare_protected(before["protected"], snapshot_using(python)["protected"])
+    after = snapshot_using(python)
+    compare_protected(before["protected"], after["protected"])
+    compare_image_runtime(before["image_runtime"], after["image_runtime"])
     return entries
 
 
@@ -519,7 +525,7 @@ def prepare(mode, prefix, artifact=None):
     )
     require(not prefix.exists(), "Venv must be a new installation prefix")
     base = snapshot_using(sys.executable)
-    report_forbidden_runtime("base", base)
+    report_image_runtime("base", base)
     policy = {}
     if mode in ("resolve", "replay"):
         artifact = artifact.resolve()
@@ -566,8 +572,9 @@ def prepare(mode, prefix, artifact=None):
     run([sys.executable, "-m", "venv", "--system-site-packages", prefix])
     python = prefix / "bin/python3"
     before = snapshot_using(python)
-    report_forbidden_runtime("venv-before-install", before)
+    report_image_runtime("venv-before-install", before)
     compare_protected(base["protected"], before["protected"])
+    compare_image_runtime(base["image_runtime"], before["image_runtime"])
     if mode == "replay":
         for name, version in lock["inherited"].items():
             require(
@@ -657,8 +664,9 @@ def prepare(mode, prefix, artifact=None):
             ]
         )
         after = snapshot_using(python)
-        report_forbidden_runtime("venv-after-install", after)
+        report_image_runtime("venv-after-install", after)
         compare_protected(before["protected"], after["protected"])
+        compare_image_runtime(before["image_runtime"], after["image_runtime"])
         if mode == "install-only":
             run(
                 [

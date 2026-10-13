@@ -41,63 +41,89 @@ class TestPrepareEnvironment(unittest.TestCase):
             "sha256": "b545d46f4d2f9d30381281cf22874bfe1d32a8a7b0ee8396fccde89f30c6a9d9",
         }
 
-    def test_no_three_package_guard_checks_distributions_modules_plan_and_lock(self):
+    def test_image_runtime_guard_requires_distributions_modules_plan_and_lock(self):
         from types import SimpleNamespace
         from unittest.mock import patch
 
-        expected_modules = {"flashinfer", "cuda", "pynvml"}
-        expected_distributions = {
-            "flashinfer-python",
-            "cuda-python",
-            "nvidia-ml-py",
+        expected = {
+            "flashinfer-python": "flashinfer",
+            "cuda-python": "cuda",
+            "nvidia-ml-py": "pynvml",
         }
         self.assertEqual(
-            set(self.tool.FORBIDDEN_RUNTIME_MODULES), expected_distributions
+            self.tool.CI_CLEANUP_IMAGE,
+            "reg.docker.alibaba-inc.com/ai-tmp/llm@sha256:"
+            "70c5c0a2468d8a0258dbd32caa88aef989dd02d4e0dd37e1ef0fca344788b1bf",
         )
+        installed = {
+            name: {"version": "1.0", "path": f"/sdk/{name}"} for name in expected
+        }
+        self.assertEqual(self.tool.IMAGE_RUNTIME_MODULES, expected)
+        specs = {
+            module: SimpleNamespace(
+                origin=(None if module == "cuda" else f"/sdk/{module}/__init__.py"),
+                submodule_search_locations=(
+                    [f"/sdk/{module}"] if module == "cuda" else None
+                ),
+            )
+            for module in expected.values()
+        }
+        with patch.object(
+            self.tool.importlib.util, "find_spec", side_effect=specs.__getitem__
+        ):
+            evidence = self.tool.inspect_image_runtime(installed)
+        self.assertEqual(evidence["distributions"], installed)
         self.assertEqual(
-            set(self.tool.FORBIDDEN_RUNTIME_MODULES.values()), expected_modules
+            evidence["modules"],
+            {
+                "flashinfer": "/sdk/flashinfer/__init__.py",
+                "cuda": "/sdk/cuda",
+                "pynvml": "/sdk/pynvml/__init__.py",
+            },
         )
-        with patch.object(self.tool.importlib.util, "find_spec", return_value=None):
-            evidence = self.tool.inspect_forbidden_runtime({"numpy": {}})
-        self.assertEqual(evidence["distributions"], [])
-        self.assertEqual(set(evidence["modules"]), expected_modules)
-        self.assertTrue(all(value is None for value in evidence["modules"].values()))
 
-        for distribution, module in self.tool.FORBIDDEN_RUNTIME_MODULES.items():
+        for distribution, module in expected.items():
             with self.subTest(distribution=distribution):
-                with (
-                    patch.object(
-                        self.tool.importlib.util, "find_spec", return_value=None
-                    ),
-                    self.assertRaisesRegex(ValueError, distribution),
-                ):
-                    self.tool.inspect_forbidden_runtime({distribution: {}})
-                with self.assertRaisesRegex(
-                    ValueError, "Forbidden runtime replacement"
-                ):
-                    self.tool.validate_plan(
-                        {"install": [self.entry(distribution)]}, self.protected, {}
-                    )
-                with self.assertRaisesRegex(ValueError, "Forbidden locked dependency"):
-                    self.tool.validate_locked([{"name": distribution}], self.protected)
-            with self.subTest(module=module):
-                spec = SimpleNamespace(
-                    origin=f"/unexpected/{module}/__init__.py",
-                    submodule_search_locations=None,
-                )
+                missing = dict(installed)
+                missing.pop(distribution)
                 with (
                     patch.object(
                         self.tool.importlib.util,
                         "find_spec",
-                        side_effect=lambda name, target=module, value=spec: (
-                            value if name == target else None
+                        side_effect=specs.__getitem__,
+                    ),
+                    self.assertRaisesRegex(ValueError, distribution),
+                ):
+                    self.tool.inspect_image_runtime(missing)
+                protected = {
+                    **self.protected,
+                    "distributions": {
+                        **self.protected["distributions"],
+                        distribution: installed[distribution],
+                    },
+                }
+                with self.assertRaisesRegex(
+                    ValueError, "Forbidden runtime replacement"
+                ):
+                    self.tool.validate_plan(
+                        {"install": [self.entry(distribution)]}, protected, {}
+                    )
+                with self.assertRaisesRegex(ValueError, "Forbidden locked dependency"):
+                    self.tool.validate_locked([{"name": distribution}], protected)
+            with self.subTest(module=module):
+                with (
+                    patch.object(
+                        self.tool.importlib.util,
+                        "find_spec",
+                        side_effect=lambda name, target=module: (
+                            None if name == target else specs[name]
                         ),
                     ),
                     self.assertRaisesRegex(ValueError, module),
                 ):
-                    self.tool.inspect_forbidden_runtime({})
+                    self.tool.inspect_image_runtime(installed)
 
-    def test_no_three_package_evidence_is_reported_for_each_environment(self):
+    def test_image_runtime_evidence_is_reported_for_each_environment(self):
         import ast
         import contextlib
         import io
@@ -108,22 +134,23 @@ class TestPrepareEnvironment(unittest.TestCase):
             for node in ast.walk(tree)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
-            and node.func.id == "report_forbidden_runtime"
+            and node.func.id == "report_image_runtime"
             and node.args
             and isinstance(node.args[0], ast.Constant)
         }
         self.assertEqual(labels, {"base", "venv-before-install", "venv-after-install"})
         state = {
-            "forbidden_runtime": {
-                "distributions": [],
-                "modules": {"flashinfer": None, "cuda": None, "pynvml": None},
+            "image_runtime": {
+                "distributions": {"flashinfer-python": {"version": "0.6.15.post1"}},
+                "modules": {"flashinfer": "/sdk/flashinfer/__init__.py"},
             }
         }
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            self.tool.report_forbidden_runtime("base", state)
+            self.tool.report_image_runtime("base", state)
         self.assertIn(
-            'No-three-package check base: {"distributions": []', output.getvalue()
+            'Image runtime check base: {"distributions": {"flashinfer-python"',
+            output.getvalue(),
         )
 
     def test_torchvision_plan_and_lock_require_cpu_binary(self):
@@ -320,9 +347,17 @@ class TestPrepareEnvironment(unittest.TestCase):
                 "torch": [],
                 "google-api-python-client": [],
             },
-            "forbidden_runtime": {
-                "distributions": [],
-                "modules": {"flashinfer": None, "cuda": None, "pynvml": None},
+            "image_runtime": {
+                "distributions": {
+                    "flashinfer-python": {"version": "0.6.15.post1"},
+                    "cuda-python": {"version": "13.4.1"},
+                    "nvidia-ml-py": {"version": "12.560.30"},
+                },
+                "modules": {
+                    "flashinfer": "/sdk/flashinfer/__init__.py",
+                    "cuda": "/sdk/cuda",
+                    "pynvml": "/sdk/pynvml.py",
+                },
             },
             "protected": self.protected,
         }
@@ -470,13 +505,35 @@ class TestPrepareEnvironment(unittest.TestCase):
             )
 
         torch, triton = dist("torch", []), dist("triton", [])
+        image_distributions = [
+            dist("flashinfer-python", []),
+            dist("cuda-python", []),
+            dist("nvidia-ml-py", []),
+        ]
         consumer = dist("consumer", ['cloud-tpu-client; extra == "tpu"'])
         duplicate = dist("consumer", ["Cloud_TPU_Client>=0.10"])
+        module_specs = {
+            "flashinfer": SimpleNamespace(
+                origin="/sdk/flashinfer/__init__.py", submodule_search_locations=None
+            ),
+            "cuda": SimpleNamespace(
+                origin=None, submodule_search_locations=["/sdk/cuda"]
+            ),
+            "pynvml": SimpleNamespace(
+                origin="/sdk/pynvml.py", submodule_search_locations=None
+            ),
+        }
         with (
             patch.object(
                 self.tool.metadata,
                 "distributions",
-                return_value=[torch, triton, consumer, duplicate],
+                return_value=[
+                    torch,
+                    triton,
+                    *image_distributions,
+                    consumer,
+                    duplicate,
+                ],
             ),
             patch.object(
                 self.tool.metadata,
@@ -493,7 +550,11 @@ class TestPrepareEnvironment(unittest.TestCase):
                 "import_module",
                 side_effect=lambda n: SimpleNamespace(__file__=f"/sdk/{n}/__init__.py"),
             ),
-            patch.object(self.tool.importlib.util, "find_spec", return_value=None),
+            patch.object(
+                self.tool.importlib.util,
+                "find_spec",
+                side_effect=module_specs.__getitem__,
+            ),
         ):
             actual = self.tool.snapshot()
         self.assertEqual(
@@ -501,16 +562,28 @@ class TestPrepareEnvironment(unittest.TestCase):
             consumer.requires + duplicate.requires,
         )
         self.assertEqual(
-            actual.get("forbidden_runtime"),
+            actual.get("image_runtime"),
             {
-                "distributions": [],
-                "modules": {"flashinfer": None, "cuda": None, "pynvml": None},
+                "distributions": {
+                    name: {"version": "1.0", "path": f"/sdk"}
+                    for name in (
+                        "flashinfer-python",
+                        "cuda-python",
+                        "nvidia-ml-py",
+                    )
+                },
+                "modules": {
+                    "flashinfer": "/sdk/flashinfer/__init__.py",
+                    "cuda": "/sdk/cuda",
+                    "pynvml": "/sdk/pynvml.py",
+                },
             },
         )
 
     def test_install_only_never_resolves_or_normalizes_runtime(self):
         self.assertIn('"install-only"', TOOL.read_text())
         from unittest.mock import patch
+
         from test_sail_wheel_manifest import wheel
 
         with tempfile.TemporaryDirectory() as temp:
@@ -542,9 +615,9 @@ class TestPrepareEnvironment(unittest.TestCase):
             self.assertFalse((artifact / "runtime-deps.lock.json").exists())
 
     def test_static_install_check_does_not_import_runtime(self):
+        import inspect
         from types import SimpleNamespace
         from unittest.mock import patch
-        import inspect
 
         self.assertIn(
             "static_only", inspect.signature(self.tool.check_installed).parameters
@@ -616,8 +689,9 @@ class TestPrepareEnvironment(unittest.TestCase):
         import json
         import os
         from unittest.mock import patch
-        from test_sail_wheel_manifest import wheel
+
         import sail_wheel_manifest as manifest
+        from test_sail_wheel_manifest import wheel
 
         self.assertTrue(hasattr(self.tool, "normalize_ci_image"))
         with tempfile.TemporaryDirectory() as temp:
@@ -680,6 +754,7 @@ class TestPrepareEnvironment(unittest.TestCase):
         import json
         import os
         from unittest.mock import patch
+
         import sail_wheel_manifest as manifest
         from test_sail_wheel_manifest import wheel
 
@@ -793,6 +868,7 @@ class TestPrepareEnvironment(unittest.TestCase):
         import os
         import subprocess
         from unittest.mock import patch
+
         import sail_wheel_manifest as manifest
         from test_sail_wheel_manifest import wheel
 

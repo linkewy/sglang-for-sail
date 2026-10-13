@@ -65,7 +65,7 @@ class TestBuildContract(unittest.TestCase):
             (ROOT / ".github/workflows/_pr-test-ppu-build.yml").read_text()
         )
         commands = "\n".join(
-            s.get("run", "") for s in workflow["jobs"]["lint"]["steps"]
+            s.get("run", "") for s in workflow["jobs"]["ppu-lint"]["steps"]
         )
         checked = []
         for line in commands.splitlines():
@@ -424,7 +424,7 @@ class TestWorkflowContract(unittest.TestCase):
         self.assertIn("runtime", jobs)
         build, runtime = jobs["build"], jobs["runtime"]
         self.assertEqual(runtime["needs"], "build")
-        self.assertEqual(runtime["runs-on"], "ubuntu-24.04")
+        self.assertEqual(runtime["runs-on"], "k8s-runner-group-cpu-thead")
         self.assertEqual(runtime["container"]["image"], "${{ inputs.build_image }}")
         self.assertNotIn("SAIL_ALLOW_IMAGE_CLEANUP", build["env"])
         self.assertEqual(runtime["env"]["SAIL_ALLOW_IMAGE_CLEANUP"], "1")
@@ -857,9 +857,9 @@ const github = {rest: {actions: {
             self.assertIn("dubious ownership", check(checkout, env).stderr)
             self.assertFalse((root / "absent-global-config").exists())
 
-    def test_hosted_build_resource_contract(self):
+    def test_k8s_build_resource_contract(self):
         build = self.load("_pr-test-ppu-build.yml")["jobs"]["build"]
-        self.assertEqual(build["runs-on"], "ubuntu-24.04")
+        self.assertEqual(build["runs-on"], "k8s-runner-group-cpu-thead")
         self.assertEqual(build["container"]["image"], "${{ inputs.build_image }}")
         self.assertEqual(build["env"].get("SGL_KERNEL_COMPILE_THREADS"), "2")
         self.assertEqual(build["env"].get("CARGO_BUILD_JOBS"), "2")
@@ -886,16 +886,11 @@ const github = {rest: {actions: {
         for name in ("_pr-test-ppu-build.yml", "_pr-test-ppu-smoke.yml"):
             jobs = self.load(name)["jobs"]
             for job_name, job in jobs.items():
-                if job_name == "lint":
+                if job_name == "ppu-lint":
                     self.assertEqual(job["runs-on"], "ubuntu-latest")
-                    self.assertEqual(jobs["build"]["needs"], "lint")
+                    self.assertEqual(jobs["build"]["needs"], "ppu-lint")
                 else:
-                    expected_runner = (
-                        "ubuntu-24.04"
-                        if job_name in ("build", "runtime")
-                        else "k8s-runner-group-cpu-thead"
-                    )
-                    self.assertEqual(job["runs-on"], expected_runner)
+                    self.assertEqual(job["runs-on"], "k8s-runner-group-cpu-thead")
                     self.assertIn("container", job)
                 self.assertNotIn("continue-on-error", job)
                 for step in job["steps"]:
@@ -1036,6 +1031,19 @@ const github = {rest: {actions: {
                     bad[key] = "wrong"
                     (root / "ZW-M890P.json").write_text(json.dumps(bad))
                     self.assertNotEqual(execute(), 0)
+
+    def test_full_dependency_image_is_digest_pinned(self):
+        main = self.load("pr-test-ppu.yml")
+        identity = next(
+            step
+            for step in main["jobs"]["check-changes"]["steps"]
+            if step.get("id") == "identity"
+        )
+        self.assertIn(
+            "build_image=reg.docker.alibaba-inc.com/ai-tmp/llm@sha256:"
+            "70c5c0a2468d8a0258dbd32caa88aef989dd02d4e0dd37e1ef0fca344788b1bf",
+            identity["run"],
+        )
 
     def test_artifact_identity_wiring(self):
         main = self.load("pr-test-ppu.yml")["jobs"]

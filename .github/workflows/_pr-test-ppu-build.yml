@@ -28,7 +28,7 @@ permissions:
   actions: read
 
 jobs:
-  lint:
+  ppu-lint:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -46,8 +46,8 @@ jobs:
             .github/workflows/pr-test-ppu.yml .github/workflows/_pr-test-ppu-build.yml .github/workflows/_pr-test-ppu-smoke.yml
 
   build:
-    needs: lint
-    runs-on: ubuntu-24.04
+    needs: ppu-lint
+    runs-on: k8s-runner-group-cpu-thead
     container:
       image: ${{ inputs.build_image }}
     timeout-minutes: 120
@@ -153,7 +153,7 @@ jobs:
 
   runtime:
     needs: build
-    runs-on: ubuntu-24.04
+    runs-on: k8s-runner-group-cpu-thead
     container:
       image: ${{ inputs.build_image }}
     timeout-minutes: 45
