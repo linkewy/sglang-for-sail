@@ -142,6 +142,56 @@ class TestPrepareEnvironment(unittest.TestCase):
                     self.tool.check_torchvision()
                 vision.ops.nms.assert_not_called()
 
+    def test_test_entrypoints_import_without_running_device_tests(self):
+        from unittest.mock import patch
+
+        self.assertTrue(hasattr(self.tool, "check_test_entrypoints"))
+        paths = ("test/run_suite.py", "test/registered/ppu/test_sail_qwen3_smoke.py")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for relative in paths:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    "from pathlib import Path\n"
+                    "import unittest\n"
+                    "Path(__file__).with_suffix('.imported').touch()\n"
+                    "class DeviceTest(unittest.TestCase):\n"
+                    "    @classmethod\n"
+                    "    def setUpClass(cls):\n"
+                    "        raise RuntimeError('device setup must not run')\n"
+                    "    def test_device(self):\n"
+                    "        raise RuntimeError('device test must not run')\n"
+                    "if __name__ == '__main__':\n"
+                    "    raise RuntimeError('entrypoint main must not run')\n"
+                )
+            with patch.object(self.tool, "SELF", root / "scripts/ci/ppu/prepare.py"):
+                self.tool.check_test_entrypoints()
+            for relative in paths:
+                self.assertTrue((root / relative).with_suffix(".imported").is_file())
+
+    def test_test_entrypoints_propagate_missing_dependencies(self):
+        from unittest.mock import patch
+
+        self.assertTrue(hasattr(self.tool, "check_test_entrypoints"))
+        paths = ("test/run_suite.py", "test/registered/ppu/test_sail_qwen3_smoke.py")
+        for failing in paths:
+            with self.subTest(path=failing), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                for relative in paths:
+                    path = root / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(
+                        "import sail_ci_deliberately_missing_dependency\n"
+                        if relative == failing
+                        else "pass\n"
+                    )
+                with (
+                    patch.object(self.tool, "SELF", root / "scripts/ci/ppu/prepare.py"),
+                    self.assertRaisesRegex(ModuleNotFoundError, "deliberately_missing"),
+                ):
+                    self.tool.check_test_entrypoints()
+
     def test_runtime_resolver_includes_image_protobuf_consumers(self):
         import ast
 
@@ -420,7 +470,7 @@ class TestPrepareEnvironment(unittest.TestCase):
                 (root / f"{name}.whl").touch()
             with (
                 patch.object(self.tool.sys, "prefix", str(root)),
-                patch.object(self.tool, "inspect_wheel", side_effect=records * 3),
+                patch.object(self.tool, "inspect_wheel", side_effect=records * 4),
                 patch.object(
                     self.tool.metadata,
                     "distribution",
@@ -437,6 +487,9 @@ class TestPrepareEnvironment(unittest.TestCase):
                     self.tool, "check_torchvision", create=True
                 ) as check_vision,
                 patch.object(
+                    self.tool, "check_test_entrypoints", create=True
+                ) as check_entrypoints,
+                patch.object(
                     self.tool.importlib,
                     "import_module",
                     return_value=SimpleNamespace(__file__=str(site / "__init__.py")),
@@ -444,11 +497,17 @@ class TestPrepareEnvironment(unittest.TestCase):
             ):
                 self.tool.check_installed(root, static_only=True)
                 check_vision.assert_not_called()
+                check_entrypoints.assert_not_called()
                 import_runtime.assert_not_called()
                 self.tool.check_installed(root)
                 check_vision.assert_called_once_with()
                 import_runtime.assert_called_once_with("sglang")
+                check_entrypoints.assert_called_once_with()
+                check_entrypoints.side_effect = ModuleNotFoundError("tabulate")
+                with self.assertRaisesRegex(ModuleNotFoundError, "tabulate"):
+                    self.tool.check_installed(root)
                 import_runtime.reset_mock()
+                check_entrypoints.reset_mock(side_effect=True)
                 check_vision.side_effect = RuntimeError("native operator unavailable")
                 with self.assertRaisesRegex(
                     RuntimeError, "native operator unavailable"
@@ -669,7 +728,7 @@ class TestPrepareEnvironment(unittest.TestCase):
             rust_toolchain="1.92",
             vendor_runtime=before["protected"]["modules"],
         )
-        for fail_check in (True, False):
+        for fail_check in ("pip", "entrypoints", None):
             with (
                 self.subTest(fail_check=fail_check),
                 tempfile.TemporaryDirectory() as temp,
@@ -692,7 +751,9 @@ class TestPrepareEnvironment(unittest.TestCase):
                 )
 
                 def execute(command, **kwargs):
-                    if fail_check and list(command)[-2:] == ["pip", "check"]:
+                    if (
+                        fail_check == "pip" and list(command)[-2:] == ["pip", "check"]
+                    ) or (fail_check == "entrypoints" and "check-installed" in command):
                         raise subprocess.CalledProcessError(1, command)
 
                 with (
@@ -719,6 +780,7 @@ class TestPrepareEnvironment(unittest.TestCase):
                         self.tool.prepare("resolve", root / "resolve", artifact)
                 normalize.assert_called_once_with(before)
                 self.assertEqual(resolve.call_args.kwargs.get("exclusions"), policy)
+                self.assertIn("tabulate", resolve.call_args.args[1])
                 vision = self.vision_record()
                 self.assertIn(
                     f"torchvision @ {vision['url']}#sha256={vision['sha256']}",

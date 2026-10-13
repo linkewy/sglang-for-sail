@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import re
+import runpy
 import shutil
 import stat
 import subprocess
@@ -410,6 +411,17 @@ def check_torchvision():
     print("CPU torchvision native NMS check passed", flush=True)
 
 
+def check_test_entrypoints():
+    root = SELF.parents[3]
+    for relative in (
+        "test/run_suite.py",
+        "test/registered/ppu/test_sail_qwen3_smoke.py",
+    ):
+        print(f"Checking test entrypoint imports: {relative}", flush=True)
+        runpy.run_path(str(root / relative), run_name="sail_ci_import_check")
+    print("Test entrypoint import checks passed", flush=True)
+
+
 def check_installed(artifact, static_only=False):
     records = [inspect_wheel(path) for path in sorted(artifact.glob("*.whl"))]
     require(
@@ -444,6 +456,7 @@ def check_installed(artifact, static_only=False):
         check_torchvision()
         imported = importlib.import_module("sglang")
         require_venv_path(Path(imported.__file__), prefix)
+        check_test_entrypoints()
 
 
 def prepare(mode, prefix, artifact=None):
@@ -557,6 +570,7 @@ def prepare(mode, prefix, artifact=None):
                     "google-api-python-client>=2",
                     "pytest",
                     "PyYAML",
+                    "tabulate",
                 ],
                 before,
                 projects,
