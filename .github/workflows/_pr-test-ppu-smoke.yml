@@ -32,7 +32,7 @@ jobs:
   smoke:
     runs-on: k8s-runner-group-cpu-thead
     container:
-      image: ${{ inputs.build_image }}
+      image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 90
     defaults:
       run:
@@ -91,7 +91,7 @@ jobs:
           echo "pid=$!" >> "$GITHUB_OUTPUT"
       - id: scheduler
         timeout-minutes: 80
-        uses: t-head/ppu-scheduler-action@26ba21dbe66fb841192796ed990f8fd2c7997ecf
+        uses: t-head/ppu-scheduler-action@main
         with:
           image: ${{ inputs.build_image }}
           command: bash scripts/ci/ppu/run_sail_smoke.sh

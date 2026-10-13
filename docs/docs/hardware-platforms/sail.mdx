@@ -243,10 +243,15 @@ covers both queueing and execution.
   container image and two concurrent kernel/Rust build jobs. Image pull access,
   available disk space, peak memory, and build time must be validated on this runner.
   Builds do not require a PPU device or Kubernetes access.
-- Smoke orchestration uses the CPU self-hosted runner `k8s-runner-group-cpu-thead`.
-  It must support explicit job containers, provide kubectl at `/opt/bin/kubectl` or
-  on PATH, and use a restricted namespace/RBAC configuration.
-- The scheduler action is pinned to revision `26ba21dbe66fb841192796ed990f8fd2c7997ecf`.
+- Smoke orchestration uses the CPU self-hosted runner `k8s-runner-group-cpu-thead`
+  with `ghcr.io/actions/actions-runner:latest` for checkout, artifact verification,
+  and scheduling. This container does not need the PPU SDK or vendor torch.
+  It must provide Python 3.11 or newer for the standard-library verification tools,
+  kubectl at `/opt/bin/kubectl` or on PATH, and restricted namespace/RBAC access.
+  Device Pods still use the same digest-pinned SDK image as build/runtime validation.
+- The scheduler action follows `t-head/ppu-scheduler-action@main`. Both this reference
+  and the orchestration image's `latest` tag are mutable; inspect the resolved action
+  revision and container image identity in each run when reproducing a failure.
   Single-device mode uses `nnodes=0` and `nproc_per_node=1`, with selectors
   `board-type=OAM-810E` and `board-type=ZW-M890P`, respectively.
 - The current namespace is `default`. Before deployment, verify job/NAS isolation,

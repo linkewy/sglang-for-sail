@@ -664,7 +664,7 @@ const github = {rest: {actions: {
         action = next(s for s in smoke["steps"] if s.get("id") == "scheduler")
         self.assertEqual(
             action["uses"],
-            "t-head/ppu-scheduler-action@26ba21dbe66fb841192796ed990f8fd2c7997ecf",
+            "t-head/ppu-scheduler-action@main",
         )
         self.assertEqual(action["timeout-minutes"], 80)
         self.assertEqual(action["with"]["timeout_minutes"], 75)
@@ -803,7 +803,15 @@ const github = {rest: {actions: {
         )
         self.assertEqual(upload["with"]["name"], download["with"]["name"])
         self.assertEqual(upload["with"]["if-no-files-found"], "error")
-        self.assertEqual(smoke["container"]["image"], "${{ inputs.build_image }}")
+        self.assertEqual(
+            smoke["container"]["image"], "ghcr.io/actions/actions-runner:latest"
+        )
+        scheduler = next(s for s in smoke["steps"] if s.get("id") == "scheduler")
+        self.assertEqual(scheduler["with"]["image"], "${{ inputs.build_image }}")
+        self.assertEqual(smoke["env"]["SAIL_BUILD_IMAGE"], "${{ inputs.build_image }}")
+        commands = "\n".join(s.get("run", "") for s in smoke["steps"])
+        self.assertNotIn("prepare_sail_env.py", commands)
+        self.assertNotIn("import torch", commands)
         self.assertEqual(
             smoke["env"]["SAIL_MANIFEST_SHA256"], "${{ inputs.manifest_sha256 }}"
         )
