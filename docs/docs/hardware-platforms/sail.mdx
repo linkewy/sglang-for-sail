@@ -117,6 +117,15 @@ packages. Dependencies are installed only as binary wheels from prevalidated URL
 and hashes. Validation runs `pip check`, checks installation paths and native hashes,
 and loads the actual Rust extension.
 
+Runtime resolution pins the official CPython 3.12 Linux x86_64
+`torchvision==0.28.0+cpu` wheel from `download-r2.pytorch.org`, including its SHA256.
+The ordinary 0.28.0 wheel references NVIDIA CUDA libraries. The CPU wheel remains
+subject to the same download checks and dependency-lock replay; vendor torch/triton
+are not replaced. Runtime validation and both smoke environments execute real CPU
+NMS and import SGLang before continuing. This verifies the required import/native
+compatibility, not PPU-accelerated torchvision operators or vision-model support.
+Build-only validation does not install or import torchvision.
+
 Only after all checks pass does it upload `wheel-python3.12-sail`, containing the
 unchanged two wheels, `runtime-deps.lock.json`, `manifest.json` with `stage: runtime`,
 and `SHA256SUMS`. The final manifest also records the original build manifest hash.

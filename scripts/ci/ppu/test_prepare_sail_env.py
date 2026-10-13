@@ -32,6 +32,116 @@ class TestPrepareEnvironment(unittest.TestCase):
             },
         }
 
+    def vision_record(self):
+        return {
+            "name": "torchvision",
+            "version": "0.28.0+cpu",
+            "url": "https://download-r2.pytorch.org/whl/cpu/torchvision-0.28.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl",
+            "filename": "torchvision-0.28.0+cpu-cp312-cp312-manylinux_2_28_x86_64.whl",
+            "sha256": "b545d46f4d2f9d30381281cf22874bfe1d32a8a7b0ee8396fccde89f30c6a9d9",
+        }
+
+    def test_torchvision_plan_and_lock_require_cpu_binary(self):
+        expected = self.vision_record()
+        candidates = [expected]
+        for field, value in (
+            ("version", "0.28.0"),
+            ("url", expected["url"].replace("download-r2.pytorch.org", "example.org")),
+            ("sha256", "a" * 64),
+        ):
+            candidates.append(dict(expected, **{field: value}))
+        for record in candidates:
+            item = {
+                "metadata": {"name": record["name"], "version": record["version"]},
+                "download_info": {
+                    "url": record["url"],
+                    "archive_info": {"hashes": {"sha256": record["sha256"]}},
+                },
+            }
+            with self.subTest(record=record):
+                if record == expected:
+                    self.assertEqual(
+                        self.tool.validate_plan(
+                            {"install": [item]}, self.protected, {}
+                        ),
+                        [expected],
+                    )
+                    self.tool.validate_locked([record], self.protected)
+                else:
+                    for validator in ("plan", "lock"):
+                        with (
+                            self.subTest(validator=validator),
+                            self.assertRaises(ValueError),
+                        ):
+                            if validator == "plan":
+                                self.tool.validate_plan(
+                                    {"install": [item]}, self.protected, {}
+                                )
+                            else:
+                                self.tool.validate_locked([record], self.protected)
+
+    def test_torchvision_check_executes_native_cpu_nms(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
+        self.assertTrue(hasattr(self.tool, "check_torchvision"))
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            vision = SimpleNamespace(
+                __file__=str(root / "lib/site-packages/torchvision/__init__.py"),
+                ops=SimpleNamespace(nms=Mock()),
+            )
+            torch = SimpleNamespace(
+                tensor=Mock(side_effect=["boxes", "scores"]), float32="float32"
+            )
+            with (
+                patch.object(self.tool.sys, "prefix", str(root)),
+                patch.object(self.tool.metadata, "version", return_value="0.28.0+cpu"),
+                patch.object(
+                    self.tool.importlib,
+                    "import_module",
+                    side_effect={"torch": torch, "torchvision": vision}.__getitem__,
+                ),
+            ):
+                for result in ([0, 2], [0, 1, 2]):
+                    torch.tensor.reset_mock(side_effect=True)
+                    torch.tensor.side_effect = ["boxes", "scores"]
+                    vision.ops.nms.return_value.tolist.return_value = result
+                    if result == [0, 2]:
+                        self.tool.check_torchvision()
+                    else:
+                        with self.assertRaisesRegex(ValueError, "NMS"):
+                            self.tool.check_torchvision()
+                    vision.ops.nms.assert_called_with("boxes", "scores", 0.5)
+                    self.assertEqual(
+                        torch.tensor.call_args_list[0].args[0],
+                        [[0, 0, 2, 2], [0, 0, 2, 2], [4, 4, 6, 6]],
+                    )
+                    self.assertEqual(
+                        torch.tensor.call_args_list[1].args[0], [0.9, 0.8, 0.7]
+                    )
+                    for call in torch.tensor.call_args_list:
+                        self.assertEqual(
+                            call.kwargs, {"dtype": "float32", "device": "cpu"}
+                        )
+                vision.ops.nms.side_effect = RuntimeError("native operator unavailable")
+                torch.tensor.side_effect = ["boxes", "scores"]
+                with self.assertRaisesRegex(
+                    RuntimeError, "native operator unavailable"
+                ):
+                    self.tool.check_torchvision()
+                vision.ops.nms.reset_mock(side_effect=True)
+                with (
+                    patch.object(self.tool.metadata, "version", return_value="0.28.0"),
+                    self.assertRaisesRegex(ValueError, "torchvision"),
+                ):
+                    self.tool.check_torchvision()
+                vision.ops.nms.assert_not_called()
+                vision.__file__ = "/system/site-packages/torchvision/__init__.py"
+                with self.assertRaisesRegex(ValueError, "fresh venv"):
+                    self.tool.check_torchvision()
+                vision.ops.nms.assert_not_called()
+
     def test_runtime_resolver_includes_image_protobuf_consumers(self):
         import ast
 
@@ -310,7 +420,7 @@ class TestPrepareEnvironment(unittest.TestCase):
                 (root / f"{name}.whl").touch()
             with (
                 patch.object(self.tool.sys, "prefix", str(root)),
-                patch.object(self.tool, "inspect_wheel", side_effect=records),
+                patch.object(self.tool, "inspect_wheel", side_effect=records * 3),
                 patch.object(
                     self.tool.metadata,
                     "distribution",
@@ -324,12 +434,27 @@ class TestPrepareEnvironment(unittest.TestCase):
                     return_value=SimpleNamespace(origin=str(site / "__init__.py")),
                 ),
                 patch.object(
+                    self.tool, "check_torchvision", create=True
+                ) as check_vision,
+                patch.object(
                     self.tool.importlib,
                     "import_module",
-                    side_effect=AssertionError("Runtime import during build"),
-                ),
+                    return_value=SimpleNamespace(__file__=str(site / "__init__.py")),
+                ) as import_runtime,
             ):
                 self.tool.check_installed(root, static_only=True)
+                check_vision.assert_not_called()
+                import_runtime.assert_not_called()
+                self.tool.check_installed(root)
+                check_vision.assert_called_once_with()
+                import_runtime.assert_called_once_with("sglang")
+                import_runtime.reset_mock()
+                check_vision.side_effect = RuntimeError("native operator unavailable")
+                with self.assertRaisesRegex(
+                    RuntimeError, "native operator unavailable"
+                ):
+                    self.tool.check_installed(root)
+                import_runtime.assert_not_called()
 
     def test_replay_preflights_identity_policy_and_lock_before_cleanup(self):
         import json
@@ -579,7 +704,9 @@ class TestPrepareEnvironment(unittest.TestCase):
                         self.tool, "normalize_ci_image", return_value=(after, policy)
                     ) as normalize,
                     patch.object(
-                        self.tool, "resolve_install", return_value=[]
+                        self.tool,
+                        "resolve_install",
+                        return_value=[self.vision_record()],
                     ) as resolve,
                     patch.object(self.tool, "run", side_effect=execute) as run,
                 ):
@@ -590,6 +717,11 @@ class TestPrepareEnvironment(unittest.TestCase):
                         self.tool.prepare("resolve", root / "resolve", artifact)
                 normalize.assert_called_once_with(before)
                 self.assertEqual(resolve.call_args.kwargs.get("exclusions"), policy)
+                vision = self.vision_record()
+                self.assertIn(
+                    f"torchvision @ {vision['url']}#sha256={vision['sha256']}",
+                    resolve.call_args.args[1],
+                )
                 commands = [list(c.args[0]) for c in run.call_args_list]
                 self.assertTrue(any(c[-2:] == ["pip", "check"] for c in commands))
                 if fail_check:
@@ -628,6 +760,8 @@ class TestPrepareEnvironment(unittest.TestCase):
                         )
                 resolve.assert_not_called()
                 install.assert_called_once()
+                self.assertEqual(install.call_args.args[1], [self.vision_record()])
+                self.assertEqual(lock["wheels"], [self.vision_record()])
                 self.assertTrue(
                     any(
                         list(c.args[0])[-2:] == ["pip", "check"]

@@ -36,6 +36,13 @@ CI_CLEANUP_IMAGE = (
     "a33a67832f7ec442c481421e94255518dd67e464406f8e610c15d2b594b21f80"
 )
 CI_IMAGE_EXCLUSIONS = {"cloud-tpu-client": "0.10"}
+CPU_TORCHVISION = {
+    "name": "torchvision",
+    "version": "0.28.0+cpu",
+    "url": "https://download-r2.pytorch.org/whl/cpu/torchvision-0.28.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl",
+    "filename": "torchvision-0.28.0+cpu-cp312-cp312-manylinux_2_28_x86_64.whl",
+    "sha256": "b545d46f4d2f9d30381281cf22874bfe1d32a8a7b0ee8396fccde89f30c6a9d9",
+}
 SELF = Path(__file__).resolve()
 
 
@@ -239,6 +246,7 @@ def validate_plan(report, protected, projects):
                 "sha256": digest,
             }
         )
+    validate_locked(entries, protected)
     return entries
 
 
@@ -248,6 +256,8 @@ def validate_locked(entries, protected):
     names, filenames = set(), set()
     for record in entries:
         name = record["name"]
+        if name == "torchvision":
+            require(record == CPU_TORCHVISION, "Expected pinned CPU torchvision wheel")
         require(
             re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name) and name == canonical(name),
             "Locked dependency name must be canonical",
@@ -370,6 +380,23 @@ def require_venv_path(path, prefix):
     return path
 
 
+def check_torchvision():
+    require(
+        metadata.version("torchvision") == CPU_TORCHVISION["version"],
+        "Expected pinned CPU torchvision version",
+    )
+    torch = importlib.import_module("torch")
+    vision = importlib.import_module("torchvision")
+    require_venv_path(Path(vision.__file__), Path(sys.prefix))
+    boxes = torch.tensor(
+        [[0, 0, 2, 2], [0, 0, 2, 2], [4, 4, 6, 6]], dtype=torch.float32, device="cpu"
+    )
+    scores = torch.tensor([0.9, 0.8, 0.7], dtype=torch.float32, device="cpu")
+    keep = vision.ops.nms(boxes, scores, 0.5)
+    require(keep.tolist() == [0, 2], "CPU torchvision NMS returned incorrect indices")
+    print("CPU torchvision native NMS check passed", flush=True)
+
+
 def check_installed(artifact, static_only=False):
     records = [inspect_wheel(path) for path in sorted(artifact.glob("*.whl"))]
     require(
@@ -401,6 +428,7 @@ def check_installed(artifact, static_only=False):
                 extension = importlib.util.spec_from_file_location(module_name, path)
                 extension.loader.exec_module(importlib.util.module_from_spec(extension))
     if not static_only:
+        check_torchvision()
         imported = importlib.import_module("sglang")
         require_venv_path(Path(imported.__file__), prefix)
 
@@ -502,6 +530,7 @@ def prepare(mode, prefix, artifact=None):
                 [
                     f"{artifact / sglang['filename']}[runtime_common]",
                     "sgl-eval==0.1.2",
+                    f"torchvision @ {CPU_TORCHVISION['url']}#sha256={CPU_TORCHVISION['sha256']}",
                     # Resolve the full consumer chain without legacy 1.x fallbacks.
                     "google-api-core>=2",
                     "googleapis-common-protos",
