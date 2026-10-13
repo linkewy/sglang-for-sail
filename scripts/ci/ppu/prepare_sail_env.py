@@ -354,9 +354,10 @@ def prepare(mode, prefix, artifact=None):
                 [
                     f"{artifact / sglang['filename']}[runtime_common]",
                     "sgl-eval==0.1.2",
-                    # Resolve the image's protobuf consumers with the new runtime.
-                    "google-api-core",
+                    # Resolve the full consumer chain without legacy 1.x fallbacks.
+                    "google-api-core>=2",
                     "googleapis-common-protos",
+                    "google-api-python-client>=2",
                     "pytest",
                     "PyYAML",
                 ],

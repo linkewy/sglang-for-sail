@@ -54,7 +54,12 @@ class TestPrepareEnvironment(unittest.TestCase):
             if isinstance(item, ast.Constant)
         }
         self.assertTrue(
-            {"google-api-core", "googleapis-common-protos"} <= requirements,
+            {
+                "google-api-core>=2",
+                "googleapis-common-protos",
+                "google-api-python-client>=2",
+            }
+            <= requirements,
             "Resolve the image's protobuf consumers together with the runtime",
         )
 
