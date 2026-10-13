@@ -84,10 +84,10 @@ jobs:
         run: |
           export PATH="/opt/bin:$PATH"
           command -v kubectl
-          kubectl auth can-i list pods --namespace default
-          kubectl get pods --namespace default \
+          timeout --kill-after=5s 20s kubectl auth can-i list pods --namespace default
+          timeout --kill-after=5s 20s kubectl get pods --namespace default \
             -l app.kubernetes.io/managed-by=ppu-distributed-action \
-            -o json --request-timeout=15s > /dev/null
+            -o json > /dev/null
           nohup python3 scripts/ci/ppu/sail_smoke_checks.py observe \
             --namespace default --selector "$BOARD_SELECTOR" --output "$RUNNER_TEMP/ppu-pod.json" \
             > "$RUNNER_TEMP/ppu-observer.log" 2>&1 < /dev/null &

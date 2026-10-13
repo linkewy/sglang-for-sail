@@ -135,7 +135,6 @@ def observe_pod(output, namespace, selector):
                     "app.kubernetes.io/managed-by=ppu-distributed-action",
                     "-o",
                     "json",
-                    "--request-timeout=15s",
                 ],
                 capture_output=True,
                 text=True,

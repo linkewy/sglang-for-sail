@@ -345,6 +345,11 @@ class TestSmokeChecks(unittest.TestCase):
                 self.tool.observe_pod(output, "default", "board-type=OAM-810E")
                 self.assertEqual(json.loads(output.read_text())["uid"], "uid")
                 self.assertEqual(run.call_count, 2)
+                for call in run.call_args_list:
+                    self.assertEqual(call.kwargs["timeout"], 20)
+                    self.assertFalse(
+                        any(arg.startswith("--request-timeout") for arg in call.args[0])
+                    )
                 sleep.assert_called_once_with(5)
                 self.assertIn("API", diagnostic.getvalue())
                 self.assertIn("1/3", diagnostic.getvalue())
@@ -753,7 +758,9 @@ const github = {rest: {actions: {
         commands = observer["run"]
         self.assertIn("kubectl get pods", commands)
         self.assertIn("app.kubernetes.io/managed-by=ppu-distributed-action", commands)
-        self.assertIn("--request-timeout=15s", commands)
+        self.assertIn("timeout --kill-after=5s 20s kubectl get pods", commands)
+        self.assertIn("timeout --kill-after=5s 20s kubectl auth can-i", commands)
+        self.assertNotIn("--request-timeout", commands)
         self.assertLess(commands.index("kubectl get pods"), commands.index("nohup"))
 
     def test_build_uses_explicit_public_dependency_index(self):
