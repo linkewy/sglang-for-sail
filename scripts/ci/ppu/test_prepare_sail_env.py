@@ -41,6 +41,91 @@ class TestPrepareEnvironment(unittest.TestCase):
             "sha256": "b545d46f4d2f9d30381281cf22874bfe1d32a8a7b0ee8396fccde89f30c6a9d9",
         }
 
+    def test_no_three_package_guard_checks_distributions_modules_plan_and_lock(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        expected_modules = {"flashinfer", "cuda", "pynvml"}
+        expected_distributions = {
+            "flashinfer-python",
+            "cuda-python",
+            "nvidia-ml-py",
+        }
+        self.assertEqual(
+            set(self.tool.FORBIDDEN_RUNTIME_MODULES), expected_distributions
+        )
+        self.assertEqual(
+            set(self.tool.FORBIDDEN_RUNTIME_MODULES.values()), expected_modules
+        )
+        with patch.object(self.tool.importlib.util, "find_spec", return_value=None):
+            evidence = self.tool.inspect_forbidden_runtime({"numpy": {}})
+        self.assertEqual(evidence["distributions"], [])
+        self.assertEqual(set(evidence["modules"]), expected_modules)
+        self.assertTrue(all(value is None for value in evidence["modules"].values()))
+
+        for distribution, module in self.tool.FORBIDDEN_RUNTIME_MODULES.items():
+            with self.subTest(distribution=distribution):
+                with (
+                    patch.object(
+                        self.tool.importlib.util, "find_spec", return_value=None
+                    ),
+                    self.assertRaisesRegex(ValueError, distribution),
+                ):
+                    self.tool.inspect_forbidden_runtime({distribution: {}})
+                with self.assertRaisesRegex(
+                    ValueError, "Forbidden runtime replacement"
+                ):
+                    self.tool.validate_plan(
+                        {"install": [self.entry(distribution)]}, self.protected, {}
+                    )
+                with self.assertRaisesRegex(ValueError, "Forbidden locked dependency"):
+                    self.tool.validate_locked([{"name": distribution}], self.protected)
+            with self.subTest(module=module):
+                spec = SimpleNamespace(
+                    origin=f"/unexpected/{module}/__init__.py",
+                    submodule_search_locations=None,
+                )
+                with (
+                    patch.object(
+                        self.tool.importlib.util,
+                        "find_spec",
+                        side_effect=lambda name, target=module, value=spec: (
+                            value if name == target else None
+                        ),
+                    ),
+                    self.assertRaisesRegex(ValueError, module),
+                ):
+                    self.tool.inspect_forbidden_runtime({})
+
+    def test_no_three_package_evidence_is_reported_for_each_environment(self):
+        import ast
+        import contextlib
+        import io
+
+        tree = ast.parse(TOOL.read_text())
+        labels = {
+            node.args[0].value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "report_forbidden_runtime"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+        }
+        self.assertEqual(labels, {"base", "venv-before-install", "venv-after-install"})
+        state = {
+            "forbidden_runtime": {
+                "distributions": [],
+                "modules": {"flashinfer": None, "cuda": None, "pynvml": None},
+            }
+        }
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.tool.report_forbidden_runtime("base", state)
+        self.assertIn(
+            'No-three-package check base: {"distributions": []', output.getvalue()
+        )
+
     def test_torchvision_plan_and_lock_require_cpu_binary(self):
         expected = self.vision_record()
         candidates = [expected]
@@ -235,6 +320,10 @@ class TestPrepareEnvironment(unittest.TestCase):
                 "torch": [],
                 "google-api-python-client": [],
             },
+            "forbidden_runtime": {
+                "distributions": [],
+                "modules": {"flashinfer": None, "cuda": None, "pynvml": None},
+            },
             "protected": self.protected,
         }
 
@@ -404,11 +493,19 @@ class TestPrepareEnvironment(unittest.TestCase):
                 "import_module",
                 side_effect=lambda n: SimpleNamespace(__file__=f"/sdk/{n}/__init__.py"),
             ),
+            patch.object(self.tool.importlib.util, "find_spec", return_value=None),
         ):
             actual = self.tool.snapshot()
         self.assertEqual(
             actual.get("requirements", {}).get("consumer"),
             consumer.requires + duplicate.requires,
+        )
+        self.assertEqual(
+            actual.get("forbidden_runtime"),
+            {
+                "distributions": [],
+                "modules": {"flashinfer": None, "cuda": None, "pynvml": None},
+            },
         )
 
     def test_install_only_never_resolves_or_normalizes_runtime(self):

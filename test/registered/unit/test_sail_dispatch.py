@@ -1,3 +1,4 @@
+import ast
 import importlib.util
 import runpy
 import subprocess
@@ -156,6 +157,166 @@ class TestSailDispatch(unittest.TestCase):
         for backend in ("sail", "cuda", "cpu"):
             with self.subTest(backend=backend):
                 self.check_scenario("dual", backend)
+
+    def test_fp8_utils_only_imports_flashinfer_on_nvidia_cuda(self):
+        source = ROOT / "python/sglang/srt/layers/quantization/fp8_utils.py"
+        tree = ast.parse(source.read_text())
+        dispatch = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(child, ast.ImportFrom) and child.module == "flashinfer"
+                for child in ast.walk(node)
+            )
+            and any(
+                isinstance(child, ast.ImportFrom)
+                and child.module == "sglang.kernels.ops.gemm"
+                and any(alias.name == "fp8_scaled_mm" for alias in child.names)
+                for child in ast.walk(node)
+            )
+        )
+        executable = compile(
+            ast.fix_missing_locations(ast.Module(body=[dispatch], type_ignores=[])),
+            str(source),
+            "exec",
+        )
+        gemm = types.ModuleType("sglang.kernels.ops.gemm")
+        gemm.fp8_scaled_mm = Mock()
+        blockwise = types.ModuleType("sglang.kernels.ops.gemm.fp8_blockwise_gemm")
+        blockwise.fp8_blockwise_scaled_mm = Mock()
+        patch_torch = types.ModuleType("sglang.srt.utils.patch_torch")
+        patch_torch.register_fake_if_exists = lambda _name: lambda function: function
+        modules = {
+            gemm.__name__: gemm,
+            blockwise.__name__: blockwise,
+            patch_torch.__name__: patch_torch,
+        }
+        for sail in (True, False):
+            with self.subTest(sail=sail), patch.dict(sys.modules, modules):
+                namespace = {"_is_cuda": True, "_is_sail": sail}
+                if sail:
+                    exec(executable, namespace)
+                    self.assertIs(namespace["fp8_scaled_mm"], gemm.fp8_scaled_mm)
+                    self.assertIs(
+                        namespace["fp8_blockwise_scaled_mm"],
+                        blockwise.fp8_blockwise_scaled_mm,
+                    )
+                else:
+                    with self.assertRaisesRegex(ModuleNotFoundError, "flashinfer"):
+                        exec(executable, namespace)
+
+    def test_sampler_only_imports_flashinfer_on_nvidia_cuda(self):
+        source = ROOT / "python/sglang/srt/layers/sampler.py"
+        tree = ast.parse(source.read_text())
+        dispatch = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(child, ast.ImportFrom)
+                and child.module == "flashinfer.sampling"
+                for child in ast.walk(node)
+            )
+            and any(
+                isinstance(child, ast.ImportFrom) and child.module == "sgl_kernel"
+                for child in ast.walk(node)
+            )
+        )
+        executable = compile(
+            ast.fix_missing_locations(ast.Module(body=[dispatch], type_ignores=[])),
+            str(source),
+            "exec",
+        )
+        kernel = types.ModuleType("sgl_kernel")
+        kernel.top_k_renorm_prob = Mock()
+        kernel.top_p_renorm_prob = Mock()
+        modules = {
+            kernel.__name__: kernel,
+            "flashinfer": None,
+            "flashinfer.sampling": None,
+        }
+        for sail in (True, False):
+            with self.subTest(sail=sail), patch.dict(sys.modules, modules):
+                namespace = {
+                    "is_cuda": lambda: True,
+                    "is_sail": lambda: sail,
+                }
+                if sail:
+                    exec(executable, namespace)
+                    self.assertIs(
+                        namespace["top_k_renorm_prob"], kernel.top_k_renorm_prob
+                    )
+                    self.assertIs(
+                        namespace["top_p_renorm_prob"], kernel.top_p_renorm_prob
+                    )
+                else:
+                    with self.assertRaisesRegex(ModuleNotFoundError, "flashinfer"):
+                        exec(executable, namespace)
+
+    def test_dflash_only_imports_flashinfer_on_nvidia_cuda(self):
+        source = ROOT / "python/sglang/srt/speculative/dflash_utils.py"
+        tree = ast.parse(source.read_text())
+        dispatch = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(child, ast.ImportFrom)
+                and child.module == "flashinfer.sampling"
+                for child in ast.walk(node)
+            )
+            and any(
+                isinstance(child, ast.ImportFrom)
+                and child.module == "sglang.kernels.ops.speculative.sampling"
+                for child in ast.walk(node)
+            )
+        )
+        executable = compile(
+            ast.fix_missing_locations(ast.Module(body=[dispatch], type_ignores=[])),
+            str(source),
+            "exec",
+        )
+        flashinfer = types.ModuleType("flashinfer.sampling")
+        flashinfer.top_k_renorm_probs = Mock()
+        flashinfer.top_p_renorm_probs = Mock()
+        speculative = types.ModuleType("sglang.kernels.ops.speculative.sampling")
+        speculative.tree_speculative_sampling_target_only = Mock()
+        modules = {
+            flashinfer.__name__: flashinfer,
+            speculative.__name__: speculative,
+        }
+        for sail in (True, False):
+            with self.subTest(sail=sail), patch.dict(sys.modules, modules):
+                namespace = {
+                    "_DFLASH_SAMPLING_VERIFY_AVAILABLE": False,
+                    "is_cuda": lambda: True,
+                    "is_sail": lambda: sail,
+                    "is_musa": lambda: False,
+                    "is_hip": lambda: False,
+                }
+                exec(executable, namespace)
+                if sail:
+                    self.assertIsNone(namespace["top_k_renorm_prob"])
+                    self.assertIsNone(namespace["top_p_renorm_prob"])
+                    self.assertIsNone(
+                        namespace["tree_speculative_sampling_target_only"]
+                    )
+                    self.assertFalse(namespace["_DFLASH_SAMPLING_VERIFY_AVAILABLE"])
+                else:
+                    self.assertIs(
+                        namespace["top_k_renorm_prob"],
+                        flashinfer.top_k_renorm_probs,
+                    )
+                    self.assertIs(
+                        namespace["top_p_renorm_prob"],
+                        flashinfer.top_p_renorm_probs,
+                    )
+                    self.assertIs(
+                        namespace["tree_speculative_sampling_target_only"],
+                        speculative.tree_speculative_sampling_target_only,
+                    )
+                    self.assertTrue(namespace["_DFLASH_SAMPLING_VERIFY_AVAILABLE"])
 
     def test_norm_dispatch(self):
         for backend, dtype, compiling in (

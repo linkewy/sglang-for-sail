@@ -1,5 +1,6 @@
 import ast
 import subprocess
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -123,6 +124,15 @@ class TestBuildContract(unittest.TestCase):
         ast.parse(source)
         self.assertNotIn('"py_limited_api": "cp310"', source)
         self.assertIn("py_limited_api=False", source)
+
+    def test_sail_kernel_version_tracks_upstream_kernel(self):
+        root = ROOT / "python/sglang/kernels/aot"
+        upstream = tomllib.loads((root / "pyproject.toml").read_text())
+        sail = tomllib.loads((root / "pyproject_sail.toml").read_text())
+        self.assertEqual(sail["project"]["version"], upstream["project"]["version"])
+
+        bump = (ROOT / "scripts/release/bump_kernel_version.py").read_text()
+        self.assertIn('Path("python/sglang/kernels/aot/pyproject_sail.toml")', bump)
 
 
 class TestSmokeChecks(unittest.TestCase):
@@ -563,7 +573,8 @@ class TestWorkflowContract(unittest.TestCase):
                 SAIL_TESTED_SHA="a" * 40,
                 FIXTURE=json.dumps(records),
             )
-            harness = """
+            harness = (
+                """
 const fixture = JSON.parse(process.env.FIXTURE);
 const context = {repo: {owner: 'owner', repo: 'repo'}, eventName: 'workflow_dispatch'};
 const core = {setOutput: (key, value) => console.log(JSON.stringify({[key]: value}))};
@@ -573,7 +584,10 @@ const github = {rest: {actions: {
   listJobsForWorkflowRun: async () => ({data: {jobs: fixture.jobs}}),
 }}};
 (async () => {
-""" + script + "\n})().catch(e => {console.error(e.message); process.exitCode = 1;});"
+"""
+                + script
+                + "\n})().catch(e => {console.error(e.message); process.exitCode = 1;});"
+            )
             with self.subTest(case=name):
                 result = subprocess.run(
                     [node, "-e", harness], env=env, capture_output=True, text=True
@@ -680,6 +694,38 @@ const github = {rest: {actions: {
             )
             self.assertEqual(execute(normal).returncode, 0)
 
+    def test_smoke_normalizes_scheduler_single_device_visibility(self):
+        import os
+
+        source = (TOOLS / "run_sail_smoke.sh").read_text()
+        marker = "# Normalize the scheduler-selected PPU for the vendor runtime."
+        self.assertIn(marker, source)
+        start = source.index(marker)
+        end = source.index("unset PYTHONPATH", start)
+        snippet = source[start:end] + "\nprintf '%s\\n' \"$CUDA_VISIBLE_DEVICES\"\n"
+
+        def execute(**variables):
+            env = {"PATH": os.environ["PATH"], **variables}
+            return subprocess.run(
+                ["/bin/bash", "-eu", "-o", "pipefail", "-c", snippet],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+
+        mapped = execute(NVIDIA_VISIBLE_DEVICES="3")
+        self.assertEqual(mapped.returncode, 0, mapped.stderr)
+        self.assertEqual(mapped.stdout.strip(), "3")
+        preserved = execute(NVIDIA_VISIBLE_DEVICES="3", CUDA_VISIBLE_DEVICES="0")
+        self.assertEqual(preserved.returncode, 0, preserved.stderr)
+        self.assertEqual(preserved.stdout.strip(), "0")
+        for variables in (
+            {"NVIDIA_VISIBLE_DEVICES": "all"},
+            {"NVIDIA_VISIBLE_DEVICES": "3", "CUDA_VISIBLE_DEVICES": "0,1"},
+        ):
+            with self.subTest(variables=variables):
+                self.assertNotEqual(execute(**variables).returncode, 0)
+
     def test_smoke_git_trust_is_command_scoped_and_checks_sha(self):
         import os
         import tempfile
@@ -722,6 +768,7 @@ const github = {rest: {actions: {
             env.update(
                 SAIL_TESTED_SHA=sha,
                 SAIL_VALIDATION_SHA=sha,
+                NVIDIA_VISIBLE_DEVICES="0",
                 GIT_TEST_ASSUME_DIFFERENT_OWNER="1",
             )
 

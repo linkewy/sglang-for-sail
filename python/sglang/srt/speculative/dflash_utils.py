@@ -20,7 +20,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_sail
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
@@ -41,7 +41,7 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
 )
 
 
-if is_cuda():
+if is_cuda() and not is_sail():
     from flashinfer.sampling import top_k_renorm_probs as top_k_renorm_prob
     from flashinfer.sampling import top_p_renorm_probs as top_p_renorm_prob
 

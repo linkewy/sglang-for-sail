@@ -33,6 +33,11 @@ from sail_wheel_manifest import (
 )
 
 PROTECTED = {"torch", "triton", "torch-for-sail", "triton-for-sail"}
+FORBIDDEN_RUNTIME_MODULES = {
+    "flashinfer-python": "flashinfer",
+    "cuda-python": "cuda",
+    "nvidia-ml-py": "pynvml",
+}
 CI_CLEANUP_IMAGE = (
     "download.t-head.cn/docker_release/pytorch@sha256:"
     "a33a67832f7ec442c481421e94255518dd67e464406f8e610c15d2b594b21f80"
@@ -63,6 +68,41 @@ def run(command, **kwargs):
     )
 
 
+def inspect_forbidden_runtime(installed):
+    distributions = sorted(set(installed).intersection(FORBIDDEN_RUNTIME_MODULES))
+    modules = {}
+    for module in FORBIDDEN_RUNTIME_MODULES.values():
+        spec = importlib.util.find_spec(module)
+        if spec is None:
+            modules[module] = None
+        elif spec.origin is not None:
+            modules[module] = str(Path(spec.origin).resolve())
+        else:
+            locations = spec.submodule_search_locations or ()
+            modules[module] = ",".join(str(Path(path).resolve()) for path in locations)
+            if not modules[module]:
+                modules[module] = "<unknown>"
+    require(
+        not distributions,
+        "Forbidden runtime distributions installed: " + ", ".join(distributions),
+    )
+    importable = {name: path for name, path in modules.items() if path is not None}
+    require(
+        not importable,
+        "Forbidden runtime modules importable: "
+        + ", ".join(f"{name}={path}" for name, path in importable.items()),
+    )
+    return {"distributions": distributions, "modules": modules}
+
+
+def report_forbidden_runtime(label, state):
+    evidence = state["forbidden_runtime"]
+    print(
+        f"No-three-package check {label}: " + json.dumps(evidence, sort_keys=True),
+        flush=True,
+    )
+
+
 def snapshot():
     installed = {}
     requirements = {}
@@ -74,6 +114,7 @@ def snapshot():
                 "version": dist.version,
                 "path": str(Path(dist.locate_file("")).resolve()),
             }
+    forbidden_runtime = inspect_forbidden_runtime(installed)
     providers = metadata.packages_distributions()
     modules = {}
     for name in ("torch", "triton"):
@@ -96,6 +137,7 @@ def snapshot():
     return {
         "installed": installed,
         "requirements": requirements,
+        "forbidden_runtime": forbidden_runtime,
         "protected": {
             "modules": modules,
             "distributions": {
@@ -216,7 +258,9 @@ def safe_url(url):
 
 
 def validate_plan(report, protected, projects):
-    forbidden = PROTECTED | set(protected["distributions"])
+    forbidden = (
+        PROTECTED | set(protected["distributions"]) | set(FORBIDDEN_RUNTIME_MODULES)
+    )
     entries = []
     seen = set()
     for item in report["install"]:
@@ -253,7 +297,12 @@ def validate_plan(report, protected, projects):
 
 
 def validate_locked(entries, protected):
-    forbidden = PROTECTED | PROJECTS | set(protected["distributions"])
+    forbidden = (
+        PROTECTED
+        | PROJECTS
+        | set(protected["distributions"])
+        | set(FORBIDDEN_RUNTIME_MODULES)
+    )
     require(isinstance(entries, list), "Locked dependencies must be a list")
     names, filenames = set(), set()
     for record in entries:
@@ -470,6 +519,7 @@ def prepare(mode, prefix, artifact=None):
     )
     require(not prefix.exists(), "Venv must be a new installation prefix")
     base = snapshot_using(sys.executable)
+    report_forbidden_runtime("base", base)
     policy = {}
     if mode in ("resolve", "replay"):
         artifact = artifact.resolve()
@@ -516,6 +566,7 @@ def prepare(mode, prefix, artifact=None):
     run([sys.executable, "-m", "venv", "--system-site-packages", prefix])
     python = prefix / "bin/python3"
     before = snapshot_using(python)
+    report_forbidden_runtime("venv-before-install", before)
     compare_protected(base["protected"], before["protected"])
     if mode == "replay":
         for name, version in lock["inherited"].items():
@@ -606,6 +657,7 @@ def prepare(mode, prefix, artifact=None):
             ]
         )
         after = snapshot_using(python)
+        report_forbidden_runtime("venv-after-install", after)
         compare_protected(before["protected"], after["protected"])
         if mode == "install-only":
             run(

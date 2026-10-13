@@ -49,6 +49,7 @@ from sglang.srt.utils import (
     is_gfx1250_supported,
     is_hip,
     is_musa,
+    is_sail,
     is_xpu,
     offloader,
 )
@@ -67,6 +68,7 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
 _is_musa = is_musa()
+_is_sail = is_sail()
 
 # gfx1250 (RDNA4) cannot compile the AITER CK quant/GEMM kernels, and even when
 # CK builds it lacks the MFMA/WMMA instructions those kernels rely on. Force the
@@ -252,35 +254,36 @@ if _is_cuda:
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
-    from flashinfer import bmm_fp8 as _raw_bmm_fp8_batched
+    if not _is_sail:
+        from flashinfer import bmm_fp8 as _raw_bmm_fp8_batched
 
-    @register_custom_op(op_name="flashinfer_bmm_fp8_batched", mutates_args=["out"])
-    def _bmm_fp8_batched_op(
-        A: torch.Tensor,
-        B: torch.Tensor,
-        out: torch.Tensor,
-        A_scale: torch.Tensor,
-        B_scale: torch.Tensor,
-    ) -> None:
-        _raw_bmm_fp8_batched(A, B, A_scale, B_scale, out.dtype, out)
+        @register_custom_op(op_name="flashinfer_bmm_fp8_batched", mutates_args=["out"])
+        def _bmm_fp8_batched_op(
+            A: torch.Tensor,
+            B: torch.Tensor,
+            out: torch.Tensor,
+            A_scale: torch.Tensor,
+            B_scale: torch.Tensor,
+        ) -> None:
+            _raw_bmm_fp8_batched(A, B, A_scale, B_scale, out.dtype, out)
 
-    def bmm_fp8(
-        A: torch.Tensor,
-        B: torch.Tensor,
-        A_scale: torch.Tensor,
-        B_scale: torch.Tensor,
-        dtype: torch.dtype,
-        out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Batched (3D) per-tensor-scale FP8 matmul, via flashinfer's cuBLAS backend."""
-        if out is None:
-            out = torch.empty(
-                (A.shape[0], A.shape[1], B.shape[2]),
-                device=A.device,
-                dtype=dtype,
-            )
-        _bmm_fp8_batched_op(A, B, out, A_scale, B_scale)
-        return out
+        def bmm_fp8(
+            A: torch.Tensor,
+            B: torch.Tensor,
+            A_scale: torch.Tensor,
+            B_scale: torch.Tensor,
+            dtype: torch.dtype,
+            out: Optional[torch.Tensor] = None,
+        ) -> torch.Tensor:
+            """Batched (3D) per-tensor-scale FP8 matmul, via flashinfer's cuBLAS backend."""
+            if out is None:
+                out = torch.empty(
+                    (A.shape[0], A.shape[1], B.shape[2]),
+                    device=A.device,
+                    dtype=dtype,
+                )
+            _bmm_fp8_batched_op(A, B, out, A_scale, B_scale)
+            return out
 
 
 use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
@@ -793,7 +796,8 @@ def can_serve_block_fp8_as_mxfp8(
     weight_block_size: Optional[List[int]], scale_fmt: Optional[str]
 ) -> bool:
     """Whether a block-fp8 linear can run on the MXFP8 dense GEMMs instead of Triton:
-    a 32-wide-K ue8m0 block weight is an MXFP8 operand (block_fp8_scale_to_mxfp8_e8m0)."""
+    a 32-wide-K ue8m0 block weight is an MXFP8 operand (block_fp8_scale_to_mxfp8_e8m0).
+    """
     if weight_block_size is None or len(weight_block_size) != 2:
         return False
     if weight_block_size[1] != 32 or scale_fmt != "ue8m0":
@@ -2015,9 +2019,9 @@ def quant_weight_ue8m0(
     weight_block_size: List[int],
 ):
     assert weight_block_size == [128, 128]
-    assert weight_dequant.dtype == torch.bfloat16, (
-        f"{weight_dequant.dtype=} {weight_dequant.shape=}"
-    )
+    assert (
+        weight_dequant.dtype == torch.bfloat16
+    ), f"{weight_dequant.dtype=} {weight_dequant.shape=}"
 
     *batch_dims, n, k = weight_dequant.shape
 
@@ -2100,9 +2104,9 @@ def inverse_transform_scale_ue8m0(sf_packed, mn):
     sf_fp32 = _inverse_transform_scale_ue8m0_impl(sf_packed)
     # Can call consistency check every time since this is only called on startup
     sf_packed_recreated = transform_scale_ue8m0(sf_fp32, mn=mn, use_torch_impl=True)
-    assert torch.all(sf_packed == sf_packed_recreated), (
-        f"{sf_packed=} {sf_packed_recreated=} {sf_fp32=}"
-    )
+    assert torch.all(
+        sf_packed == sf_packed_recreated
+    ), f"{sf_packed=} {sf_packed_recreated=} {sf_fp32=}"
     return sf_fp32
 
 

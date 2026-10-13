@@ -13,7 +13,23 @@ export SAIL_ARTIFACT_DIR="$repo/wheel-python3.12-sail"
 [[ -d "$SGLANG_PPU_SMOKE_MODEL" && -f "$SGLANG_PPU_SMOKE_MODEL/config.json" ]]
 export SAIL_VALIDATION_SHA="${SAIL_VALIDATION_SHA:-$SAIL_TESTED_SHA}"
 [[ "$SAIL_VALIDATION_SHA" =~ ^[0-9a-f]{40}$ ]]
-[[ $(git -c "safe.directory=$repo" -C "$repo" rev-parse HEAD) == "$SAIL_VALIDATION_SHA" ]]
+[[ $(git -c "safe.directory=$repo" -C "$repo" rev-parse HEAD) == "$SAIL_VALIDATION_SHA" ]] || {
+  echo "Checkout HEAD differs from SAIL_VALIDATION_SHA" >&2
+  exit 1
+}
+# Normalize the scheduler-selected PPU for the vendor runtime.
+if [[ -z ${CUDA_VISIBLE_DEVICES+x} ]]; then
+  : "${NVIDIA_VISIBLE_DEVICES:?}"
+  [[ "$NVIDIA_VISIBLE_DEVICES" =~ ^[0-9]+$ ]] || {
+    echo "Expected one numeric scheduler-selected PPU" >&2
+    exit 1
+  }
+  export CUDA_VISIBLE_DEVICES="$NVIDIA_VISIBLE_DEVICES"
+fi
+[[ "$CUDA_VISIBLE_DEVICES" =~ ^[0-9]+$ ]] || {
+  echo "Expected exactly one CUDA-visible PPU" >&2
+  exit 1
+}
 unset PYTHONPATH PYTHONHOME VIRTUAL_ENV HF_HUB_OFFLINE TRANSFORMERS_OFFLINE
 export PYTHONNOUSERSITE=1 SGLANG_TEST_MAX_RETRY=0 HF_HUB_OFFLINE=0 SGLANG_IS_IN_CI=1
 work=$(mktemp -d "${TMPDIR:-/tmp}/sglang-ppu-smoke.XXXXXXXX")
