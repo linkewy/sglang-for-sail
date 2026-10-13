@@ -85,7 +85,7 @@ export SAIL_TESTED_SHA="$(git rev-parse HEAD)"
 export SAIL_BUILD_IMAGE='download.t-head.cn/docker_release/pytorch@sha256:a33a67832f7ec442c481421e94255518dd67e464406f8e610c15d2b594b21f80'
 export SGL_KERNEL_COMPILE_THREADS=16
 export PIP_INDEX_URL=https://pypi.org/simple
-bash scripts/ci/ppu/build_sail_wheels.sh /tmp/wheel-python3.12-sail
+bash scripts/ci/ppu/build_sail_wheels.sh /tmp/wheel-python3.12-sail-build
 ```
 
 The output directory must not already exist. The script rejects uncommitted changes,
@@ -94,19 +94,61 @@ shallow clones, and mismatched SHAs. It exports all Python/Rust build inputs wit
 `f401ecae76d7b4991d44920bde9edaac7e655fd8`, sets
 `PYTORCH_SAIL_ARCH="ppu_10;ppu_15"`, and validates the hgcc architecture flags.
 
-The single `wheel-python3.12-sail` artifact contains:
+The build job prepares only build tools and installs the two project wheels with
+`--no-index --no-deps` into a fresh `--system-site-packages` venv. It checks package
+metadata, installation paths, ABI tags, and native hashes without importing the
+SGLang runtime or resolving `runtime_common`. It uploads `wheel-python3.12-sail-build`:
 
 - One SGLang wheel, including the multimodal Rust extension.
 - One `sglang-kernel` wheel, including `common_ops` for both architectures.
-- `runtime-deps.lock.json`, `manifest.json`, and `SHA256SUMS`.
+- `manifest.json` with `stage: build`, and `SHA256SUMS`; no runtime dependency lock.
 
 Both wheels use the `cp312-cp312-linux_x86_64` tag; they do not claim Python 3.10/3.11
-ABI compatibility. CPU installation validation uses a fresh `--system-site-packages`
-venv, protects vendor torch/triton and their actual provider distributions, and
-rejects replacements or NVIDIA runtime packages. Third-party dependencies are
-installed only as binary wheels from prevalidated URLs and hashes. Validation then
-runs `pip check`, checks installation paths and native hashes, and loads the actual
-Rust extension. Dependency conflicts block the build.
+ABI compatibility. A successful build proves compilation and installation integrity,
+not runtime readiness. The build artifact is retained if runtime validation fails.
+
+### Separate Runtime Validation
+
+A separate CPU `runtime` job downloads the build artifact and verifies its identity
+against the build job's independent manifest hash. It never recompiles wheels. In a
+fresh container it resolves runtime dependencies, protects vendor torch/triton and
+their actual provider distributions, and rejects replacements or NVIDIA runtime
+packages. Dependencies are installed only as binary wheels from prevalidated URLs
+and hashes. Validation runs `pip check`, checks installation paths and native hashes,
+and loads the actual Rust extension.
+
+Only after all checks pass does it upload `wheel-python3.12-sail`, containing the
+unchanged two wheels, `runtime-deps.lock.json`, `manifest.json` with `stage: runtime`,
+and `SHA256SUMS`. The final manifest also records the original build manifest hash.
+Both board types consume this single validated artifact and replay the same lock.
+A build-only artifact is explicitly rejected by smoke validation.
+
+The pinned image contains `cloud-tpu-client==0.10`, which fixes an obsolete Google
+client version incompatible with the resolved runtime. Runtime validation and both
+smoke containers explicitly set `SAIL_ALLOW_IMAGE_CLEANUP=1`. This permits removal
+of only that exact package version in the pinned disposable Linux container, using
+the base interpreter before creating a venv. Any declared reverse dependency
+(including optional requirements), unexpected version, or change to another package
+or vendor provider causes failure. Dependencies of the removed package are retained.
+The exclusion policy is logged and stored in the lock; replay requires the same
+policy and rejects reintroduction. Build/tool preparation never performs this cleanup.
+The original image and the host Python environment are not modified.
+
+To validate a downloaded build artifact locally, use a new disposable container
+with the same image and the SHA/image/index variables above. With the artifact
+extracted into `/tmp/wheel-python3.12-sail-build`, run:
+
+```bash Command
+export SAIL_ALLOW_IMAGE_CLEANUP=1
+export SAIL_BUILD_MANIFEST_SHA256="$(sha256sum /tmp/wheel-python3.12-sail-build/manifest.json | cut -d' ' -f1)"
+python3 scripts/ci/ppu/prepare_sail_env.py resolve \
+  --venv /tmp/ppu-runtime --artifact /tmp/wheel-python3.12-sail-build
+```
+
+This promotes the local copy to a runtime artifact only on success. Computing the
+expected hash from the downloaded file is for local reproduction; CI takes it from
+the build job output. Dependency conflicts fail runtime validation and the overall
+CI gate, but do not discard the separately uploaded build artifact.
 
 ### Registered Smoke Tests
 
@@ -139,6 +181,7 @@ image, set the SHA/image variables above and the following variables, then run t
 wrapper:
 
 ```bash Command
+export SAIL_ALLOW_IMAGE_CLEANUP=1
 export SAIL_MANIFEST_SHA256="$(sha256sum wheel-python3.12-sail/manifest.json | cut -d' ' -f1)"
 export SAIL_SMOKE_RUN_TOKEN="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
 export SGLANG_PPU_EXPECTED_DEVICE_NAME=ZW810E
@@ -148,12 +191,13 @@ bash scripts/ci/ppu/run_sail_smoke.sh
 
 For M890P, use `SGLANG_PPU_EXPECTED_DEVICE_NAME=ZW-M890P`. Computing the hash from the
 artifact is only for local reproduction; CI must obtain the expected manifest hash
-from the build job's independent output.
+from the runtime job's independent output.
 The wrapper replays the lock, validates registration, launches the suite, and checks
 result identity and cleanup. It neither rebuilds wheels nor retries tests.
 Environment preparation is limited to 900 seconds, the suite to 2100 seconds, server
 readiness to 600 seconds, and HTTP requests to 120 seconds. The build job is limited
-to 120 minutes and each smoke job to 90 minutes. The scheduler's 75-minute limit
+to 120 minutes, runtime validation to 45 minutes, and each smoke job to 90 minutes.
+The scheduler's 75-minute limit
 covers both queueing and execution.
 
 ### Deployment Prerequisites and Validation Scope
@@ -176,9 +220,11 @@ covers both queueing and execution.
   token. After success, it must confirm that the Pod has been deleted. Each board
   uploads a completion receipt for the current `run_attempt`; the finish job checks
   that both receipts have matching identities.
-- Select **Re-run all jobs** when retrying. Rerunning only failed jobs may leave the
-  current attempt without the other board's receipt; the finish job rejects results
-  from earlier attempts.
+- If runtime validation fails before either smoke starts, **Re-run failed jobs** can
+  reuse the retained build artifact for the same SHA without recompiling. Changed
+  source requires a new run. If either board has already completed, rerun both board
+  jobs (or **Re-run all jobs**): the finish job requires both receipts from the current
+  attempt and rejects receipts from earlier attempts.
 - Maintainers must configure `pr-test-ppu-finish` as a required check and verify
   process/Pod cleanup after failures, cancellations, and timeouts.
 

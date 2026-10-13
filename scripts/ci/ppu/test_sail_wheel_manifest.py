@@ -69,6 +69,34 @@ class TestManifest(unittest.TestCase):
         self.assertEqual(len(document["wheels"]), 2)
         self.assertTrue(all(item["native_files"] for item in document["wheels"]))
 
+    def test_build_artifact_has_no_runtime_lock_and_cannot_enter_smoke(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            wheel(root, "sglang")
+            wheel(root, "sglang_kernel")
+            self.assertIn(
+                "stage", __import__("inspect").signature(self.tool.create).parameters
+            )
+            self.tool.create(root, self.identity, stage="build")
+            document = self.tool.verify(root, self.sha, self.image, stage="build")
+            self.assertEqual(document["stage"], "build")
+            self.assertNotIn("runtime_deps_sha256", document)
+            self.assertFalse((root / "runtime-deps.lock.json").exists())
+            with self.assertRaises(ValueError):
+                self.tool.verify(root, self.sha, self.image)
+            path = root / document["wheels"][0]["filename"]
+            path.write_bytes(b"tampered")
+            with self.assertRaises(ValueError):
+                self.tool.verify(root, self.sha, self.image, stage="build")
+
+    def test_runtime_artifact_requires_explicit_stage(self):
+        document = self.create()
+        self.assertEqual(document.get("stage"), "runtime")
+        with self.assertRaises(ValueError):
+            self.tool.verify(self.root, self.sha, self.image, stage="build")
+        with self.assertRaises(ValueError):
+            self.tool.create(self.root, self.identity, stage="unknown")
+
     def test_tampering_and_missing_files(self):
         self.create()
         for name in [

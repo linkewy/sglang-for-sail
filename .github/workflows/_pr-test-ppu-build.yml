@@ -11,8 +11,8 @@ on:
         required: true
     outputs:
       manifest_sha256:
-        description: Manifest SHA256 of the shared wheel artifact built in this run
-        value: ${{ jobs.build.outputs.manifest_sha256 }}
+        description: Manifest SHA256 of the runtime-validated shared wheel artifact
+        value: ${{ jobs.runtime.outputs.manifest_sha256 }}
 
 permissions:
   contents: read
@@ -79,8 +79,52 @@ jobs:
           PYTHONPATH=python "$RUNNER_TEMP/ppu-checks/bin/python3" test/registered/unit/multimodal/test_internvl_utils_import.py TestInternVLDependency -v
       - name: Prepare Rust 1.92.0
         uses: dtolnay/rust-toolchain@0be0c8e6607124ba7557736a4b6b5a8fe2b0c284
-      - name: Build and validate two wheels
+      - name: Compile and validate two wheels without runtime dependencies
         run: bash scripts/ci/ppu/build_sail_wheels.sh "$RUNNER_TEMP/wheel-python3.12-sail"
+      - id: manifest
+        run: |
+          python3 scripts/ci/ppu/sail_wheel_manifest.py verify "$RUNNER_TEMP/wheel-python3.12-sail" --stage build \
+            --expected-sha "$SAIL_TESTED_SHA" --build-image "$SAIL_BUILD_IMAGE"
+          digest=$(sha256sum "$RUNNER_TEMP/wheel-python3.12-sail/manifest.json")
+          echo "manifest_sha256=${digest%% *}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-python3.12-sail-build
+          path: ${{ runner.temp }}/wheel-python3.12-sail/
+          retention-days: 3
+          if-no-files-found: error
+          overwrite: true
+
+  runtime:
+    needs: build
+    runs-on: ubuntu-24.04
+    container:
+      image: ${{ inputs.build_image }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      manifest_sha256: ${{ steps.manifest.outputs.manifest_sha256 }}
+    env:
+      PIP_INDEX_URL: https://pypi.org/simple
+      SAIL_TESTED_SHA: ${{ inputs.tested_sha }}
+      SAIL_BUILD_IMAGE: ${{ inputs.build_image }}
+      SAIL_BUILD_MANIFEST_SHA256: ${{ needs.build.outputs.manifest_sha256 }}
+      SAIL_ALLOW_IMAGE_CLEANUP: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tested_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-python3.12-sail-build
+          path: ${{ runner.temp }}/wheel-python3.12-sail/
+      - name: Resolve and validate the runtime without rebuilding wheels
+        run: |
+          python3 scripts/ci/ppu/prepare_sail_env.py resolve \
+            --venv "$RUNNER_TEMP/ppu-runtime" --artifact "$RUNNER_TEMP/wheel-python3.12-sail"
       - id: manifest
         run: |
           python3 scripts/ci/ppu/sail_wheel_manifest.py verify "$RUNNER_TEMP/wheel-python3.12-sail" \

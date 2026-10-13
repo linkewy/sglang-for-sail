@@ -63,6 +63,578 @@ class TestPrepareEnvironment(unittest.TestCase):
             "Resolve the image's protobuf consumers together with the runtime",
         )
 
+    def cleanup_snapshot(self):
+        return {
+            "installed": {
+                "cloud-tpu-client": {"version": "0.10", "path": "/sdk"},
+                "torch": {"version": "2.13.0", "path": "/sdk"},
+                "google-api-python-client": {"version": "1.8.0", "path": "/sdk"},
+            },
+            "requirements": {
+                "cloud-tpu-client": ["google-api-python-client==1.8.0"],
+                "torch": [],
+                "google-api-python-client": [],
+            },
+            "protected": self.protected,
+        }
+
+    def test_image_cleanup_plan_is_narrow_and_fail_closed(self):
+        import copy
+
+        self.assertTrue(hasattr(self.tool, "image_cleanup_plan"))
+        before = self.cleanup_snapshot()
+        self.assertEqual(
+            self.tool.image_cleanup_plan(before), {"cloud-tpu-client": "0.10"}
+        )
+        absent = copy.deepcopy(before)
+        absent["installed"].pop("cloud-tpu-client")
+        self.assertEqual(self.tool.image_cleanup_plan(absent), {})
+        for requirement in (
+            "cloud-tpu-client>=0.10",
+            "Cloud_TPU_Client[extra] @ https://example.org/client.whl",
+            'cloud-tpu-client; extra == "tpu"',
+        ):
+            bad = copy.deepcopy(before)
+            bad["requirements"]["torch"] = [requirement]
+            with (
+                self.subTest(requirement=requirement),
+                self.assertRaisesRegex(ValueError, "reverse dependency"),
+            ):
+                self.tool.image_cleanup_plan(bad)
+        bad = copy.deepcopy(before)
+        bad["installed"]["cloud-tpu-client"]["version"] = "0.11"
+        with self.assertRaisesRegex(ValueError, "Unexpected cleanup version"):
+            self.tool.image_cleanup_plan(bad)
+        bad = copy.deepcopy(before)
+        bad["protected"]["distributions"]["cloud-tpu-client"] = {"version": "0.10"}
+        with self.assertRaisesRegex(ValueError, "protected"):
+            self.tool.image_cleanup_plan(bad)
+
+    def test_image_cleanup_requires_explicit_disposable_container(self):
+        import os
+        from unittest.mock import patch
+
+        self.assertTrue(hasattr(self.tool, "normalize_ci_image"))
+        before = self.cleanup_snapshot()
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(self.tool, "run") as run,
+        ):
+            self.assertEqual(self.tool.normalize_ci_image(before), (before, {}))
+            run.assert_not_called()
+        for overrides in (
+            {"SAIL_BUILD_IMAGE": "untrusted:latest"},
+            {"KUBERNETES_SERVICE_HOST": ""},
+        ):
+            env = {
+                "SAIL_ALLOW_IMAGE_CLEANUP": "1",
+                "SAIL_BUILD_IMAGE": self.tool.CI_CLEANUP_IMAGE,
+                "KUBERNETES_SERVICE_HOST": "test-cluster",
+                **overrides,
+            }
+            with (
+                self.subTest(overrides=overrides),
+                patch.dict(os.environ, env, clear=True),
+                patch.object(self.tool.sys, "platform", "linux"),
+                patch.object(self.tool.sys, "prefix", self.tool.sys.base_prefix),
+                patch.object(Path, "is_file", return_value=False),
+                patch.object(self.tool, "run") as run,
+                self.assertRaises(ValueError),
+            ):
+                self.tool.normalize_ci_image(before)
+            run.assert_not_called()
+
+    def test_image_cleanup_uninstalls_only_the_approved_package(self):
+        import copy
+        import os
+        from unittest.mock import patch
+
+        self.assertTrue(hasattr(self.tool, "normalize_ci_image"))
+        before = self.cleanup_snapshot()
+        after = copy.deepcopy(before)
+        after["installed"].pop("cloud-tpu-client")
+        after["requirements"].pop("cloud-tpu-client")
+        env = {
+            "SAIL_ALLOW_IMAGE_CLEANUP": "1",
+            "SAIL_BUILD_IMAGE": self.tool.CI_CLEANUP_IMAGE,
+            "KUBERNETES_SERVICE_HOST": "test-cluster",
+        }
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch.object(self.tool.sys, "platform", "linux"),
+            patch.object(self.tool.sys, "prefix", self.tool.sys.base_prefix),
+            patch.object(self.tool, "run") as run,
+            patch.object(self.tool, "snapshot_using", return_value=after),
+        ):
+            actual, policy = self.tool.normalize_ci_image(before)
+            self.assertEqual(actual, after)
+            self.assertEqual(policy, {"cloud-tpu-client": "0.10"})
+            run.assert_called_once_with(
+                [
+                    self.tool.sys.executable,
+                    "-m",
+                    "pip",
+                    "uninstall",
+                    "--yes",
+                    "cloud-tpu-client",
+                ]
+            )
+            run.reset_mock()
+            self.assertEqual(self.tool.normalize_ci_image(after), (after, policy))
+            run.assert_not_called()
+            for changed in ("torch", "google-api-python-client"):
+                bad = copy.deepcopy(after)
+                bad["installed"][changed]["version"] = "changed"
+                with (
+                    self.subTest(changed=changed),
+                    patch.object(self.tool, "snapshot_using", return_value=bad),
+                    self.assertRaises(ValueError),
+                ):
+                    self.tool.normalize_ci_image(before)
+
+    def test_cleanup_policy_must_match_replay(self):
+        self.assertTrue(hasattr(self.tool, "validate_image_exclusions"))
+        policy = {"cloud-tpu-client": "0.10"}
+        self.tool.validate_image_exclusions(policy, policy, {"torch": {}})
+        for expected, actual, installed in (
+            (policy, {}, {}),
+            ({}, policy, {}),
+            (policy, policy, {"cloud-tpu-client": {"version": "0.10"}}),
+        ):
+            with (
+                self.subTest(actual=actual, installed=installed),
+                self.assertRaises(ValueError),
+            ):
+                self.tool.validate_image_exclusions(expected, actual, installed)
+
+    def test_snapshot_collects_all_declared_reverse_dependencies(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        def dist(name, requirements):
+            return SimpleNamespace(
+                metadata={"Name": name},
+                version="1.0",
+                requires=requirements,
+                files=[f"{name}/__init__.py"],
+                locate_file=lambda p: Path("/sdk") / p,
+            )
+
+        torch, triton = dist("torch", []), dist("triton", [])
+        consumer = dist("consumer", ['cloud-tpu-client; extra == "tpu"'])
+        duplicate = dist("consumer", ["Cloud_TPU_Client>=0.10"])
+        with (
+            patch.object(
+                self.tool.metadata,
+                "distributions",
+                return_value=[torch, triton, consumer, duplicate],
+            ),
+            patch.object(
+                self.tool.metadata,
+                "packages_distributions",
+                return_value={"torch": ["torch"], "triton": ["triton"]},
+            ),
+            patch.object(
+                self.tool.metadata,
+                "distribution",
+                side_effect={"torch": torch, "triton": triton}.get,
+            ),
+            patch.object(
+                self.tool.importlib,
+                "import_module",
+                side_effect=lambda n: SimpleNamespace(__file__=f"/sdk/{n}/__init__.py"),
+            ),
+        ):
+            actual = self.tool.snapshot()
+        self.assertEqual(
+            actual.get("requirements", {}).get("consumer"),
+            consumer.requires + duplicate.requires,
+        )
+
+    def test_install_only_never_resolves_or_normalizes_runtime(self):
+        self.assertIn('"install-only"', TOOL.read_text())
+        from unittest.mock import patch
+        from test_sail_wheel_manifest import wheel
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            artifact = root / "artifact"
+            artifact.mkdir()
+            wheel(artifact, "sglang")
+            wheel(artifact, "sglang_kernel")
+            with (
+                patch.object(
+                    self.tool, "snapshot_using", return_value=self.cleanup_snapshot()
+                ),
+                patch.object(self.tool, "run") as run,
+                patch.object(self.tool, "resolve_install") as resolve,
+                patch.object(self.tool, "install_locked") as replay,
+                patch.object(self.tool, "normalize_ci_image", create=True) as normalize,
+            ):
+                self.tool.prepare("install-only", root / "venv", artifact)
+            resolve.assert_not_called()
+            replay.assert_not_called()
+            normalize.assert_not_called()
+            commands = [[str(x) for x in call.args[0]] for call in run.call_args_list]
+            install = next(cmd for cmd in commands if "install" in cmd)
+            self.assertIn("--no-deps", install)
+            self.assertIn("--no-index", install)
+            self.assertFalse(any(cmd[-2:] == ["pip", "check"] for cmd in commands))
+            check = next(cmd for cmd in commands if "check-installed" in cmd)
+            self.assertIn("--static-only", check)
+            self.assertFalse((artifact / "runtime-deps.lock.json").exists())
+
+    def test_static_install_check_does_not_import_runtime(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        import inspect
+
+        self.assertIn(
+            "static_only", inspect.signature(self.tool.check_installed).parameters
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            site = root / "lib/site-packages"
+            site.mkdir(parents=True)
+            native = site / "native.so"
+            native.write_bytes(b"native")
+            records = [
+                {
+                    "name": name,
+                    "version": "1.0",
+                    "native_files": {"native.so": self.tool.sha256(native)},
+                }
+                for name in ("sglang", "sglang-kernel")
+            ]
+            for name in ("sglang", "sglang_kernel"):
+                (root / f"{name}.whl").touch()
+            with (
+                patch.object(self.tool.sys, "prefix", str(root)),
+                patch.object(self.tool, "inspect_wheel", side_effect=records),
+                patch.object(
+                    self.tool.metadata,
+                    "distribution",
+                    return_value=SimpleNamespace(
+                        version="1.0", locate_file=lambda p: site / p
+                    ),
+                ),
+                patch.object(
+                    self.tool.importlib.util,
+                    "find_spec",
+                    return_value=SimpleNamespace(origin=str(site / "__init__.py")),
+                ),
+                patch.object(
+                    self.tool.importlib,
+                    "import_module",
+                    side_effect=AssertionError("Runtime import during build"),
+                ),
+            ):
+                self.tool.check_installed(root, static_only=True)
+
+    def test_replay_preflights_identity_policy_and_lock_before_cleanup(self):
+        import json
+        import os
+        from unittest.mock import patch
+        from test_sail_wheel_manifest import wheel
+        import sail_wheel_manifest as manifest
+
+        self.assertTrue(hasattr(self.tool, "normalize_ci_image"))
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            wheel(root, "sglang")
+            wheel(root, "sglang_kernel")
+            before = self.cleanup_snapshot()
+            identity = dict(
+                git_sha="a" * 40,
+                build_image=self.tool.CI_CLEANUP_IMAGE,
+                sailify_revision=manifest.SAILIFY_REVISION,
+                rust_toolchain="1.92",
+                vendor_runtime={
+                    "torch": {"distribution": "torch", "version": "2.13.0"},
+                    "triton": {"distribution": "triton", "version": "3.7.0"},
+                },
+            )
+            base_lock = dict(
+                schema_version=1,
+                protected=before["protected"],
+                inherited={},
+                wheels=[],
+                image_exclusions={"cloud-tpu-client": "0.10"},
+            )
+            for kind in ("policy", "provider", "inherited", "locked", "identity"):
+                lock = dict(base_lock)
+                if kind == "policy":
+                    lock["image_exclusions"] = {}
+                elif kind == "provider":
+                    lock["protected"] = {}
+                elif kind == "inherited":
+                    lock["inherited"] = {"missing": "1.0"}
+                elif kind == "locked":
+                    lock["wheels"] = [{"name": "torch"}]
+                (root / "runtime-deps.lock.json").write_text(json.dumps(lock))
+                manifest.create(root, identity)
+                env = dict(
+                    SAIL_ALLOW_IMAGE_CLEANUP="1",
+                    SAIL_BUILD_IMAGE=self.tool.CI_CLEANUP_IMAGE,
+                    SAIL_TESTED_SHA=("b" if kind == "identity" else "a") * 40,
+                    KUBERNETES_SERVICE_HOST="test-cluster",
+                )
+                with (
+                    self.subTest(kind=kind),
+                    patch.dict(os.environ, env, clear=True),
+                    patch.object(self.tool.sys, "platform", "linux"),
+                    patch.object(self.tool.sys, "prefix", self.tool.sys.base_prefix),
+                    patch.object(self.tool, "snapshot_using", return_value=before),
+                    patch.object(self.tool, "normalize_ci_image") as normalize,
+                    patch.object(self.tool, "run") as run,
+                    self.assertRaises(ValueError),
+                ):
+                    self.tool.prepare("replay", root / "venv", root)
+                normalize.assert_not_called()
+                run.assert_not_called()
+
+    def test_replay_checks_bootstrap_and_actual_venv_before_install(self):
+        import copy
+        import ensurepip
+        import json
+        import os
+        from unittest.mock import patch
+        import sail_wheel_manifest as manifest
+        from test_sail_wheel_manifest import wheel
+
+        for kind in ("bootstrap", "pip", "google-api-python-client"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                wheel(root, "sglang")
+                wheel(root, "sglang_kernel")
+                base = self.cleanup_snapshot()
+                base["installed"].pop("cloud-tpu-client")
+                base["requirements"].pop("cloud-tpu-client")
+                base["installed"]["pip"] = {"version": "system-pip", "path": "/sdk"}
+                current = copy.deepcopy(base)
+                current["installed"]["pip"]["version"] = ensurepip.version()
+                inherited = {
+                    "pip": ensurepip.version(),
+                    "google-api-python-client": "1.8.0",
+                }
+                if kind == "bootstrap":
+                    inherited["pip"] = "wrong-bootstrap-version"
+                else:
+                    current["installed"][kind]["version"] = "changed-in-venv"
+                lock = dict(
+                    schema_version=1,
+                    protected=base["protected"],
+                    inherited=inherited,
+                    wheels=[],
+                    image_exclusions={},
+                )
+                (root / "runtime-deps.lock.json").write_text(json.dumps(lock))
+                identity = dict(
+                    git_sha="a" * 40,
+                    build_image=self.tool.CI_CLEANUP_IMAGE,
+                    sailify_revision=manifest.SAILIFY_REVISION,
+                    rust_toolchain="1.92",
+                    vendor_runtime={
+                        "torch": {"distribution": "torch", "version": "2.13.0"},
+                        "triton": {"distribution": "triton", "version": "3.7.0"},
+                    },
+                )
+                manifest.create(root, identity)
+                with (
+                    patch.dict(
+                        os.environ,
+                        {
+                            "SAIL_BUILD_IMAGE": identity["build_image"],
+                            "SAIL_TESTED_SHA": identity["git_sha"],
+                        },
+                        clear=True,
+                    ),
+                    patch.object(
+                        self.tool,
+                        "snapshot_using",
+                        side_effect=[base, current, current],
+                    ),
+                    patch.object(
+                        self.tool, "normalize_ci_image", return_value=(base, {})
+                    ) as normalize,
+                    patch.object(self.tool, "install_locked") as install,
+                    patch.object(self.tool, "run") as run,
+                    self.assertRaisesRegex(
+                        ValueError, "Inherited dependency differs"
+                    ) as error,
+                ):
+                    self.tool.prepare("replay", root / "venv", root)
+                self.assertIn(
+                    "pip" if kind == "bootstrap" else kind, str(error.exception)
+                )
+                install.assert_not_called()
+                if kind == "bootstrap":
+                    normalize.assert_not_called()
+                    run.assert_not_called()
+                else:
+                    normalize.assert_called_once()
+                    self.assertEqual(len(run.call_args_list), 1)
+                    self.assertIn("venv", run.call_args.args[0])
+
+    def test_resolver_rejects_excluded_package_before_download(self):
+        import inspect
+        import json
+        from unittest.mock import patch
+
+        self.assertIn(
+            "exclusions", inspect.signature(self.tool.resolve_install).parameters
+        )
+        item = self.entry(
+            "cloud-tpu-client",
+            "https://example.org/cloud_tpu_client-1.0-py3-none-any.whl",
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "pip-report.json").write_text(json.dumps({"install": [item]}))
+            with (
+                patch.object(self.tool, "run"),
+                patch.object(self.tool, "install_locked") as install,
+                self.assertRaisesRegex(ValueError, "Excluded package"),
+            ):
+                self.tool.resolve_install(
+                    "unused",
+                    [],
+                    self.cleanup_snapshot(),
+                    {},
+                    root,
+                    exclusions={"cloud-tpu-client": "0.10"},
+                )
+            install.assert_not_called()
+
+    def test_runtime_promotion_and_replay_keep_wheel_identity(self):
+        import copy
+        import json
+        import os
+        import subprocess
+        from unittest.mock import patch
+        import sail_wheel_manifest as manifest
+        from test_sail_wheel_manifest import wheel
+
+        before = self.cleanup_snapshot()
+        before["installed"]["triton"] = {"version": "3.7.0", "path": "/sdk"}
+        before["requirements"]["triton"] = []
+        before["protected"]["modules"]["triton"] = {
+            "distribution": "triton",
+            "version": "3.7.0",
+            "path": "/sdk/triton/__init__.py",
+        }
+        after = copy.deepcopy(before)
+        after["installed"].pop("cloud-tpu-client")
+        after["requirements"].pop("cloud-tpu-client")
+        import ensurepip
+
+        for snapshot in (before, after):
+            snapshot["installed"]["pip"] = {
+                "version": "different-system-pip",
+                "path": "/sdk",
+            }
+            snapshot["requirements"]["pip"] = []
+        venv = copy.deepcopy(after)
+        venv["installed"]["pip"] = {"version": ensurepip.version(), "path": "/venv"}
+        policy = {"cloud-tpu-client": "0.10"}
+        identity = dict(
+            git_sha="a" * 40,
+            build_image=self.tool.CI_CLEANUP_IMAGE,
+            sailify_revision=manifest.SAILIFY_REVISION,
+            rust_toolchain="1.92",
+            vendor_runtime=before["protected"]["modules"],
+        )
+        for fail_check in (True, False):
+            with (
+                self.subTest(fail_check=fail_check),
+                tempfile.TemporaryDirectory() as temp,
+            ):
+                root = Path(temp)
+                artifact = root / "artifact"
+                artifact.mkdir()
+                wheel(artifact, "sglang")
+                wheel(artifact, "sglang_kernel")
+                built = manifest.create(artifact, identity, stage="build")
+                digest = manifest.sha256(artifact / "manifest.json")
+                env = dict(
+                    SAIL_ALLOW_IMAGE_CLEANUP="1",
+                    SAIL_BUILD_IMAGE=self.tool.CI_CLEANUP_IMAGE,
+                    SAIL_TESTED_SHA="a" * 40,
+                    SAIL_BUILD_MANIFEST_SHA256=digest,
+                    KUBERNETES_SERVICE_HOST="test-cluster",
+                )
+
+                def execute(command, **kwargs):
+                    if fail_check and list(command)[-2:] == ["pip", "check"]:
+                        raise subprocess.CalledProcessError(1, command)
+
+                with (
+                    patch.dict(os.environ, env, clear=True),
+                    patch.object(self.tool.sys, "platform", "linux"),
+                    patch.object(self.tool.sys, "prefix", self.tool.sys.base_prefix),
+                    patch.object(
+                        self.tool, "snapshot_using", side_effect=[before, venv, venv]
+                    ),
+                    patch.object(
+                        self.tool, "normalize_ci_image", return_value=(after, policy)
+                    ) as normalize,
+                    patch.object(
+                        self.tool, "resolve_install", return_value=[]
+                    ) as resolve,
+                    patch.object(self.tool, "run", side_effect=execute) as run,
+                ):
+                    if fail_check:
+                        with self.assertRaises(subprocess.CalledProcessError):
+                            self.tool.prepare("resolve", root / "resolve", artifact)
+                    else:
+                        self.tool.prepare("resolve", root / "resolve", artifact)
+                normalize.assert_called_once_with(before)
+                self.assertEqual(resolve.call_args.kwargs.get("exclusions"), policy)
+                commands = [list(c.args[0]) for c in run.call_args_list]
+                self.assertTrue(any(c[-2:] == ["pip", "check"] for c in commands))
+                if fail_check:
+                    self.assertFalse((artifact / "runtime-deps.lock.json").exists())
+                    self.assertEqual(
+                        manifest.sha256(artifact / "manifest.json"), digest
+                    )
+                    continue
+                validated = manifest.verify(
+                    artifact, identity["git_sha"], identity["build_image"]
+                )
+                self.assertEqual(validated["wheels"], built["wheels"])
+                self.assertEqual(validated["build_manifest_sha256"], digest)
+                lock = json.loads((artifact / "runtime-deps.lock.json").read_text())
+                self.assertEqual(lock["image_exclusions"], policy)
+                self.assertNotIn("cloud-tpu-client", lock["inherited"])
+                with (
+                    patch.dict(os.environ, env, clear=True),
+                    patch.object(self.tool.sys, "platform", "linux"),
+                    patch.object(self.tool.sys, "prefix", self.tool.sys.base_prefix),
+                    patch.object(
+                        self.tool, "snapshot_using", side_effect=[before, venv, venv]
+                    ),
+                    patch.object(
+                        self.tool, "normalize_ci_image", return_value=(after, policy)
+                    ),
+                    patch.object(self.tool, "resolve_install") as resolve,
+                    patch.object(self.tool, "install_locked") as install,
+                    patch.object(self.tool, "run") as run,
+                ):
+                    try:
+                        self.tool.prepare("replay", root / "replay", artifact)
+                    except ValueError as exc:
+                        self.fail(
+                            f"Valid venv lock must replay despite system pip: {exc}"
+                        )
+                resolve.assert_not_called()
+                install.assert_called_once()
+                self.assertTrue(
+                    any(
+                        list(c.args[0])[-2:] == ["pip", "check"]
+                        for c in run.call_args_list
+                    )
+                )
+
     def test_accept_binary_plan(self):
         result = self.tool.validate_plan(
             {"install": [self.entry()]}, self.protected, {}

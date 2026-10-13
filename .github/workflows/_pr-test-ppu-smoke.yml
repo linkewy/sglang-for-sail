@@ -37,6 +37,7 @@ jobs:
     env:
       SAIL_TESTED_SHA: ${{ inputs.tested_sha }}
       SAIL_BUILD_IMAGE: ${{ inputs.build_image }}
+      SAIL_ALLOW_IMAGE_CLEANUP: '1'
       SAIL_MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
       SGLANG_PPU_EXPECTED_DEVICE_NAME: ${{ inputs.expected_device_name }}
       SGLANG_PPU_SMOKE_MODEL: ${{ inputs.model_path }}
@@ -97,7 +98,7 @@ jobs:
           timeout_minutes: 75
           cleanup_policy: always
           job_suffix: sglang-${{ inputs.expected_device_name }}
-          extra_env: SAIL_SMOKE_RUN_TOKEN=${{ steps.prepare.outputs.run_token }}
+          extra_env: SAIL_SMOKE_RUN_TOKEN=${{ steps.prepare.outputs.run_token }},SAIL_ALLOW_IMAGE_CLEANUP=1
       - name: Verify Pod evidence and cleanup
         timeout-minutes: 2
         env:

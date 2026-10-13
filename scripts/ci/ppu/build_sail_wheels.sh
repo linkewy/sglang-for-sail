@@ -105,9 +105,10 @@ cp "$work/source/python/pyproject_other.toml" "$work/source/python/pyproject.tom
 # Use the image's Python interpreter to validate in a separate environment,
 # without inheriting the build-tool venv.
 base_python=$("$work/tools/bin/python3" -c 'import sys; print(sys._base_executable)')
-"$base_python" "$helper" resolve --venv "$work/verify" --artifact "$work/artifact"
-[[ -f "$work/artifact/runtime-deps.lock.json" ]]
-"$base_python" "$manifest" create "$work/artifact" --expected-sha "$SAIL_TESTED_SHA" --build-image "$SAIL_BUILD_IMAGE"
+"$base_python" "$helper" install-only --venv "$work/verify" --artifact "$work/artifact"
+"$base_python" "$helper" snapshot > "$work/image.json"
+"$base_python" "$manifest" create "$work/artifact" --stage build --snapshot "$work/image.json" \
+  --expected-sha "$SAIL_TESTED_SHA" --build-image "$SAIL_BUILD_IMAGE"
 mkdir -p "$(dirname "$output")"
 mv "$work/artifact" "$output"
-"$base_python" "$manifest" verify "$output" --expected-sha "$SAIL_TESTED_SHA" --build-image "$SAIL_BUILD_IMAGE"
+"$base_python" "$manifest" verify "$output" --stage build --expected-sha "$SAIL_TESTED_SHA" --build-image "$SAIL_BUILD_IMAGE"

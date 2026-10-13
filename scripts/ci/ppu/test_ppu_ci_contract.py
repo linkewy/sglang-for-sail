@@ -24,7 +24,8 @@ class TestBuildContract(unittest.TestCase):
             "pyproject_other.toml",
             "pyproject_sail.toml",
             "f401ecae76d7b4991d44920bde9edaac7e655fd8",
-            "runtime-deps.lock.json",
+            "install-only",
+            "--stage build",
             "rustup toolchain install 1.92",
         ):
             with self.subTest(required=required):
@@ -299,6 +300,46 @@ class TestWorkflowContract(unittest.TestCase):
         self.assertTrue(path.is_file(), f"{name} is missing")
         return yaml.safe_load(path.read_text())
 
+    def test_build_and_runtime_jobs_are_separate(self):
+        workflow = self.load("_pr-test-ppu-build.yml")
+        jobs = workflow["jobs"]
+        self.assertIn("runtime", jobs)
+        build, runtime = jobs["build"], jobs["runtime"]
+        self.assertEqual(runtime["needs"], "build")
+        self.assertEqual(runtime["runs-on"], "ubuntu-24.04")
+        self.assertEqual(runtime["container"]["image"], "${{ inputs.build_image }}")
+        self.assertNotIn("SAIL_ALLOW_IMAGE_CLEANUP", build["env"])
+        self.assertEqual(runtime["env"]["SAIL_ALLOW_IMAGE_CLEANUP"], "1")
+        self.assertEqual(
+            runtime["env"]["SAIL_BUILD_MANIFEST_SHA256"],
+            "${{ needs.build.outputs.manifest_sha256 }}",
+        )
+        self.assertEqual(
+            workflow[True]["workflow_call"]["outputs"]["manifest_sha256"]["value"],
+            "${{ jobs.runtime.outputs.manifest_sha256 }}",
+        )
+        commands = "\n".join(s.get("run", "") for s in runtime["steps"])
+        self.assertIn("prepare_sail_env.py resolve", commands)
+        self.assertNotIn("build_sail_wheels.sh", commands)
+        self.assertNotIn(
+            '"$helper" resolve', (TOOLS / "build_sail_wheels.sh").read_text()
+        )
+        raw = next(
+            s for s in build["steps"] if s.get("uses") == "actions/upload-artifact@v4"
+        )
+        download = next(
+            s
+            for s in runtime["steps"]
+            if s.get("uses") == "actions/download-artifact@v4"
+        )
+        self.assertEqual(raw["with"]["name"], "wheel-python3.12-sail-build")
+        self.assertEqual(raw["with"]["name"], download["with"]["name"])
+        self.assertEqual(raw["with"]["if-no-files-found"], "error")
+        smoke = self.load("_pr-test-ppu-smoke.yml")["jobs"]["smoke"]
+        self.assertEqual(smoke["env"]["SAIL_ALLOW_IMAGE_CLEANUP"], "1")
+        scheduler = next(s for s in smoke["steps"] if s.get("id") == "scheduler")
+        self.assertIn("SAIL_ALLOW_IMAGE_CLEANUP=1", scheduler["with"]["extra_env"])
+
     def test_build_uses_explicit_public_dependency_index(self):
         build = self.load("_pr-test-ppu-build.yml")["jobs"]["build"]
         self.assertEqual(build["env"].get("PIP_INDEX_URL"), "https://pypi.org/simple")
@@ -381,7 +422,7 @@ class TestWorkflowContract(unittest.TestCase):
                 else:
                     expected_runner = (
                         "ubuntu-24.04"
-                        if job_name == "build"
+                        if job_name in ("build", "runtime")
                         else "k8s-runner-group-cpu-thead"
                     )
                     self.assertEqual(job["runs-on"], expected_runner)
@@ -535,10 +576,12 @@ class TestWorkflowContract(unittest.TestCase):
             main["ppu-smoke"]["with"]["manifest_sha256"],
             "${{ needs.ppu-wheel-build.outputs.manifest_sha256 }}",
         )
-        build = self.load("_pr-test-ppu-build.yml")["jobs"]["build"]
+        jobs = self.load("_pr-test-ppu-build.yml")["jobs"]
+        self.assertIn("runtime", jobs)
+        runtime = jobs["runtime"]
         smoke = self.load("_pr-test-ppu-smoke.yml")["jobs"]["smoke"]
         upload = next(
-            s for s in build["steps"] if s.get("uses") == "actions/upload-artifact@v4"
+            s for s in runtime["steps"] if s.get("uses") == "actions/upload-artifact@v4"
         )
         download = next(
             s for s in smoke["steps"] if s.get("uses") == "actions/download-artifact@v4"

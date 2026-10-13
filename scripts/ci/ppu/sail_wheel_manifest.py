@@ -157,8 +157,9 @@ def checksums(root, files):
     return "".join(f"{sha256(root / name)}  {name}\n" for name in sorted(files))
 
 
-def create(root, identity):
+def create(root, identity, stage="runtime"):
     root = Path(root)
+    require(stage in ("build", "runtime"), "Unknown artifact stage")
     validate_identity(identity)
     wheels = [inspect_wheel(path) for path in sorted(root.glob("*.whl"))]
     require(
@@ -166,34 +167,42 @@ def create(root, identity):
         "Exactly one wheel per project is required",
     )
     lock = root / "runtime-deps.lock.json"
-    require(
-        read_json(lock).get("schema_version") == 1, "Unknown dependency lock schema"
-    )
+    if stage == "runtime":
+        require(
+            read_json(lock).get("schema_version") == 1, "Unknown dependency lock schema"
+        )
+    else:
+        require(not lock.exists(), "Build artifact must not include a runtime lock")
     document = dict(
         identity,
         schema_version=1,
+        stage=stage,
         python_tag="cp312",
         abi_tag="cp312",
         platform_tag="linux_x86_64",
         pytorch_sail_arch=ARCHES,
         build_image_digest=identity["build_image"].split("@", 1)[1],
         wheels=wheels,
-        runtime_deps_sha256=sha256(lock),
     )
+    files = [w["filename"] for w in wheels] + ["manifest.json"]
+    if stage == "runtime":
+        document["runtime_deps_sha256"] = sha256(lock)
+        files.append(lock.name)
     (root / "manifest.json").write_text(
         json.dumps(document, indent=2, sort_keys=True) + "\n"
     )
-    files = [w["filename"] for w in wheels] + ["manifest.json", lock.name]
     (root / "SHA256SUMS").write_text(checksums(root, files))
-    verify(root, identity["git_sha"], identity["build_image"])
+    verify(root, identity["git_sha"], identity["build_image"], stage=stage)
     return document
 
 
-def verify(root, expected_sha, expected_image):
+def verify(root, expected_sha, expected_image, stage="runtime"):
     root = Path(root)
+    require(stage in ("build", "runtime"), "Unknown artifact stage")
     document = read_json(root / "manifest.json")
     try:
         validate_identity(document)
+        require(document["stage"] == stage, "Artifact stage mismatch")
         require(
             type(document["schema_version"]) is int and document["schema_version"] == 1,
             "Unknown manifest schema",
@@ -217,11 +226,14 @@ def verify(root, expected_sha, expected_image):
         )
         files = [basename(w["filename"]) for w in wheels]
         require(len(files) == len(set(files)), "Duplicate wheel filename")
-        expected_files = set(files) | {
-            "manifest.json",
-            "runtime-deps.lock.json",
-            "SHA256SUMS",
-        }
+        expected_files = set(files) | {"manifest.json", "SHA256SUMS"}
+        if stage == "runtime":
+            expected_files.add("runtime-deps.lock.json")
+        else:
+            require(
+                "runtime_deps_sha256" not in document,
+                "Build artifact claims a runtime lock",
+            )
         require(
             {p.name for p in root.iterdir()} == expected_files,
             "Artifact file set mismatch",
@@ -231,14 +243,16 @@ def verify(root, expected_sha, expected_image):
                 inspect_wheel(root / record["filename"]) == record,
                 "Wheel metadata/hash mismatch",
             )
-        require(
-            sha256(root / "runtime-deps.lock.json") == document["runtime_deps_sha256"],
-            "Dependency lock hash mismatch",
-        )
-        require(
-            read_json(root / "runtime-deps.lock.json").get("schema_version") == 1,
-            "Unknown dependency lock schema",
-        )
+        if stage == "runtime":
+            require(
+                sha256(root / "runtime-deps.lock.json")
+                == document["runtime_deps_sha256"],
+                "Dependency lock hash mismatch",
+            )
+            require(
+                read_json(root / "runtime-deps.lock.json").get("schema_version") == 1,
+                "Unknown dependency lock schema",
+            )
         require(
             regular(root / "SHA256SUMS").read_text()
             == checksums(root, expected_files - {"SHA256SUMS"}),
@@ -255,9 +269,17 @@ def main():
     parser.add_argument("artifact_dir", type=Path)
     parser.add_argument("--expected-sha", required=True)
     parser.add_argument("--build-image", required=True)
+    parser.add_argument("--stage", choices=["build", "runtime"], default="runtime")
+    parser.add_argument("--snapshot", type=Path)
     args = parser.parse_args()
     if args.command == "create":
-        lock = read_json(args.artifact_dir / "runtime-deps.lock.json")
+        if args.stage == "build":
+            require(
+                args.snapshot is not None, "Build creation requires an image snapshot"
+            )
+            lock = read_json(args.snapshot)
+        else:
+            lock = read_json(args.artifact_dir / "runtime-deps.lock.json")
         identity = {
             "git_sha": args.expected_sha,
             "build_image": args.build_image,
@@ -265,9 +287,9 @@ def main():
             "rust_toolchain": "1.92",
             "vendor_runtime": lock["protected"]["modules"],
         }
-        create(args.artifact_dir, identity)
+        create(args.artifact_dir, identity, stage=args.stage)
     else:
-        verify(args.artifact_dir, args.expected_sha, args.build_image)
+        verify(args.artifact_dir, args.expected_sha, args.build_image, stage=args.stage)
     print(f"Artifact {args.command}: OK")
 
 

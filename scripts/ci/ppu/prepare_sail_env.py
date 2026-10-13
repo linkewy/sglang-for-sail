@@ -1,4 +1,5 @@
 import argparse
+import ensurepip
 import importlib
 import importlib.metadata as metadata
 import importlib.util
@@ -21,13 +22,20 @@ from sail_wheel_manifest import (
     PROJECTS,
     basename,
     canonical,
+    create as create_artifact,
     inspect_wheel,
     read_json,
     require,
     sha256,
+    verify as verify_artifact,
 )
 
 PROTECTED = {"torch", "triton", "torch-for-sail", "triton-for-sail"}
+CI_CLEANUP_IMAGE = (
+    "download.t-head.cn/docker_release/pytorch@sha256:"
+    "a33a67832f7ec442c481421e94255518dd67e464406f8e610c15d2b594b21f80"
+)
+CI_IMAGE_EXCLUSIONS = {"cloud-tpu-client": "0.10"}
 SELF = Path(__file__).resolve()
 
 
@@ -48,8 +56,10 @@ def run(command, **kwargs):
 
 def snapshot():
     installed = {}
+    requirements = {}
     for dist in metadata.distributions():
         name = canonical(dist.metadata["Name"])
+        requirements.setdefault(name, []).extend(dist.requires or [])
         if name not in installed:
             installed[name] = {
                 "version": dist.version,
@@ -76,6 +86,7 @@ def snapshot():
     protected_names = PROTECTED | {item["distribution"] for item in modules.values()}
     return {
         "installed": installed,
+        "requirements": requirements,
         "protected": {
             "modules": modules,
             "distributions": {
@@ -93,6 +104,90 @@ def snapshot_using(python):
 
 def compare_protected(before, after):
     require(before == after, "Vendor torch/triton distribution or import path changed")
+
+
+def ci_image_exclusions():
+    enabled = os.environ.get("SAIL_ALLOW_IMAGE_CLEANUP", "0")
+    require(enabled in ("0", "1"), "Invalid image cleanup opt-in")
+    if enabled == "0":
+        return {}
+    require(
+        os.environ.get("SAIL_BUILD_IMAGE") == CI_CLEANUP_IMAGE,
+        "Unapproved cleanup image",
+    )
+    require(
+        sys.platform == "linux" and sys.prefix == sys.base_prefix,
+        "Image cleanup requires the base Linux interpreter",
+    )
+    require(
+        Path("/.dockerenv").is_file()
+        or bool(os.environ.get("KUBERNETES_SERVICE_HOST")),
+        "Image cleanup requires an explicitly disposable container",
+    )
+    return dict(CI_IMAGE_EXCLUSIONS)
+
+
+def image_cleanup_plan(before):
+    protected = PROTECTED | set(before["protected"]["distributions"])
+    require(
+        not protected.intersection(CI_IMAGE_EXCLUSIONS),
+        "Cannot clean up a protected provider",
+    )
+    require(
+        set(before["installed"]) <= set(before["requirements"]),
+        "Incomplete reverse dependency snapshot",
+    )
+    for consumer, requirements in before["requirements"].items():
+        if consumer in CI_IMAGE_EXCLUSIONS:
+            continue
+        for requirement in requirements:
+            match = re.match(
+                r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?=[\[(@;<>=!~]|$)", requirement
+            )
+            require(match is not None, f"Unrecognized requirement from {consumer}")
+            require(
+                canonical(match[1]) not in CI_IMAGE_EXCLUSIONS,
+                f"Cleanup blocked by reverse dependency: {consumer}: {requirement}",
+            )
+    plan = {}
+    for name, version in CI_IMAGE_EXCLUSIONS.items():
+        if name in before["installed"]:
+            require(
+                before["installed"][name]["version"] == version,
+                f"Unexpected cleanup version: {name}",
+            )
+            plan[name] = version
+    return plan
+
+
+def validate_image_exclusions(expected, actual, installed):
+    require(expected == actual, "Image exclusion policy mismatch")
+    require(
+        not set(actual).intersection(installed),
+        "Excluded package is still installed or planned",
+    )
+
+
+def normalize_ci_image(before):
+    policy = ci_image_exclusions()
+    if not policy:
+        return before, policy
+    plan = image_cleanup_plan(before)
+    print("CI image cleanup plan:", json.dumps(plan, sort_keys=True), flush=True)
+    if plan:
+        run([sys.executable, "-m", "pip", "uninstall", "--yes", *sorted(plan)])
+        after = snapshot_using(sys.executable)
+        compare_protected(before["protected"], after["protected"])
+        for field in ("installed", "requirements"):
+            expected = {k: v for k, v in before[field].items() if k not in plan}
+            require(
+                after[field] == expected, f"Image cleanup changed unrelated {field}"
+            )
+    else:
+        after = before
+    validate_image_exclusions(policy, policy, after["installed"])
+    print("CI image exclusions:", json.dumps(policy, sort_keys=True), flush=True)
+    return after, policy
 
 
 def safe_url(url):
@@ -234,7 +329,7 @@ def install_locked(python, entries, cache, protected):
         run([python, "-m", "pip", "install", "--no-index", "--no-deps", *files])
 
 
-def resolve_install(python, requirements, before, projects, work):
+def resolve_install(python, requirements, before, projects, work, exclusions=None):
     constraints = work / "protected.txt"
     constraints.write_text(
         "".join(
@@ -259,6 +354,8 @@ def resolve_install(python, requirements, before, projects, work):
         ]
     )
     entries = validate_plan(read_json(report), before["protected"], projects)
+    policy = exclusions or {}
+    validate_image_exclusions(policy, policy, {r["name"] for r in entries})
     install_locked(python, entries, work, before["protected"])
     compare_protected(before["protected"], snapshot_using(python)["protected"])
     return entries
@@ -273,7 +370,7 @@ def require_venv_path(path, prefix):
     return path
 
 
-def check_installed(artifact):
+def check_installed(artifact, static_only=False):
     records = [inspect_wheel(path) for path in sorted(artifact.glob("*.whl"))]
     require(
         len(records) == 2 and {r["name"] for r in records} == PROJECTS,
@@ -295,12 +392,17 @@ def check_installed(artifact):
             require(
                 sha256(path) == digest, "Installed native extension differs from wheel"
             )
-            if record["name"] == "sglang" and "multimodal" in relative:
+            if (
+                not static_only
+                and record["name"] == "sglang"
+                and "multimodal" in relative
+            ):
                 module_name = Path(relative).name.split(".")[0]
                 extension = importlib.util.spec_from_file_location(module_name, path)
                 extension.loader.exec_module(importlib.util.module_from_spec(extension))
-    imported = importlib.import_module("sglang")
-    require_venv_path(Path(imported.__file__), prefix)
+    if not static_only:
+        imported = importlib.import_module("sglang")
+        require_venv_path(Path(imported.__file__), prefix)
 
 
 def prepare(mode, prefix, artifact=None):
@@ -308,12 +410,58 @@ def prepare(mode, prefix, artifact=None):
         sys.version_info[:2] == (3, 12) and sys.implementation.name == "cpython",
         "CPython 3.12 required",
     )
+    require(
+        mode in ("tools", "install-only", "resolve", "replay"),
+        "Unknown environment mode",
+    )
     require(not prefix.exists(), "Venv must be a new installation prefix")
     base = snapshot_using(sys.executable)
+    policy = {}
+    if mode in ("resolve", "replay"):
+        artifact = artifact.resolve()
+        document = verify_artifact(
+            artifact,
+            os.environ.get("SAIL_TESTED_SHA", ""),
+            os.environ.get("SAIL_BUILD_IMAGE", ""),
+            stage="build" if mode == "resolve" else "runtime",
+        )
+        manifest_digest = sha256(artifact / "manifest.json")
+        if mode == "resolve":
+            require(
+                manifest_digest == os.environ.get("SAIL_BUILD_MANIFEST_SHA256"),
+                "Build manifest hash mismatch",
+            )
+            compare_protected(document["vendor_runtime"], base["protected"]["modules"])
+        policy = ci_image_exclusions()
+        if mode == "replay":
+            lock = read_json(artifact / "runtime-deps.lock.json")
+            require(lock["schema_version"] == 1, "Unknown dependency lock schema")
+            compare_protected(lock["protected"], base["protected"])
+            validate_locked(lock["wheels"], base["protected"])
+            validate_image_exclusions(
+                lock.get("image_exclusions", {}),
+                policy,
+                set(lock["inherited"]) | {r["name"] for r in lock["wheels"]},
+            )
+            for name, version in lock["inherited"].items():
+                expected = (
+                    ensurepip.version()
+                    if name == "pip"
+                    else base["installed"].get(name, {}).get("version")
+                )
+                require(expected == version, f"Inherited dependency differs: {name}")
+        base, actual_policy = normalize_ci_image(base)
+        validate_image_exclusions(policy, actual_policy, base["installed"])
     run([sys.executable, "-m", "venv", "--system-site-packages", prefix])
     python = prefix / "bin/python3"
     before = snapshot_using(python)
     compare_protected(base["protected"], before["protected"])
+    if mode == "replay":
+        for name, version in lock["inherited"].items():
+            require(
+                before["installed"].get(name, {}).get("version") == version,
+                f"Inherited dependency differs: {name}",
+            )
     with tempfile.TemporaryDirectory(prefix="sail-deps-") as temp:
         work = Path(temp)
         if mode == "tools":
@@ -364,6 +512,7 @@ def prepare(mode, prefix, artifact=None):
                 before,
                 projects,
                 work,
+                exclusions=policy,
             )
             added = {r["name"] for r in entries} | PROJECTS
             inherited = {
@@ -376,16 +525,9 @@ def prepare(mode, prefix, artifact=None):
                 "protected": before["protected"],
                 "inherited": inherited,
                 "wheels": entries,
+                "image_exclusions": policy,
             }
-        else:
-            lock = read_json(lock_path)
-            require(lock["schema_version"] == 1, "Unknown dependency lock schema")
-            compare_protected(lock["protected"], before["protected"])
-            for name, version in lock["inherited"].items():
-                require(
-                    before["installed"].get(name, {}).get("version") == version,
-                    f"Inherited dependency differs: {name}",
-                )
+        elif mode == "replay":
             install_locked(python, lock["wheels"], work, before["protected"])
         run(
             [
@@ -394,15 +536,44 @@ def prepare(mode, prefix, artifact=None):
                 "pip",
                 "install",
                 "--no-deps",
+                "--no-index",
                 "--force-reinstall",
                 *[artifact / w["filename"] for w in wheels],
             ]
         )
-        compare_protected(before["protected"], snapshot_using(python)["protected"])
+        after = snapshot_using(python)
+        compare_protected(before["protected"], after["protected"])
+        if mode == "install-only":
+            run(
+                [
+                    python,
+                    "-s",
+                    SELF,
+                    "check-installed",
+                    "--static-only",
+                    "--artifact",
+                    artifact,
+                ],
+                cwd=work,
+            )
+            return
+        validate_image_exclusions(policy, policy, after["installed"])
         run([python, "-m", "pip", "check"])
         run([python, "-s", SELF, "check-installed", "--artifact", artifact], cwd=work)
         if mode == "resolve":
+            require(
+                sha256(artifact / "manifest.json") == manifest_digest,
+                "Build manifest changed during validation",
+            )
+            require(
+                [inspect_wheel(artifact / w["filename"]) for w in document["wheels"]]
+                == document["wheels"],
+                "Built wheels changed during runtime validation",
+            )
             lock_path.write_text(json.dumps(lock, indent=2, sort_keys=True) + "\n")
+            create_artifact(
+                artifact, dict(document, build_manifest_sha256=manifest_digest)
+            )
 
 
 def validate_staging(root):
@@ -437,6 +608,7 @@ def main():
         choices=[
             "snapshot",
             "tools",
+            "install-only",
             "resolve",
             "replay",
             "check-installed",
@@ -446,11 +618,12 @@ def main():
     parser.add_argument("--venv", type=Path)
     parser.add_argument("--artifact", type=Path)
     parser.add_argument("--source", type=Path)
+    parser.add_argument("--static-only", action="store_true")
     args = parser.parse_args()
     if args.command == "snapshot":
         print(json.dumps(snapshot()))
     elif args.command == "check-installed":
-        check_installed(args.artifact)
+        check_installed(args.artifact, static_only=args.static_only)
     elif args.command == "check-staging":
         validate_staging(args.source)
     else:
