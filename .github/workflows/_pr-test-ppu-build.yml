@@ -126,8 +126,7 @@ jobs:
         if: inputs.reuse_build_run_id != ''
         uses: actions/download-artifact@v4
         with:
-          artifact-ids: ${{ steps.reuse.outputs.artifact_id }}
-          merge-multiple: true
+          name: wheel-python3.12-sail-build
           run-id: ${{ inputs.reuse_build_run_id }}
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/wheel-python3.12-sail/

@@ -358,11 +358,9 @@ class TestWorkflowContract(unittest.TestCase):
         download = next(s for s in steps if s.get("id") == "reuse_download")
         self.assertEqual(download["if"], "inputs.reuse_build_run_id != ''")
         self.assertEqual(download["with"]["run-id"], "${{ inputs.reuse_build_run_id }}")
-        self.assertEqual(
-            download["with"]["artifact-ids"], "${{ steps.reuse.outputs.artifact_id }}"
-        )
+        self.assertEqual(download["with"].get("name"), "wheel-python3.12-sail-build")
+        self.assertNotIn("artifact-ids", download["with"])
         self.assertEqual(download["with"]["github-token"], "${{ github.token }}")
-        self.assertIs(download["with"].get("merge-multiple"), True)
         manifest = next(s for s in steps if s.get("id") == "manifest")
         self.assertIn('"$REUSE_BUILD_MANIFEST_SHA256"', manifest["run"])
         for name in ("ppu-wheel-build", "ppu-smoke"):
