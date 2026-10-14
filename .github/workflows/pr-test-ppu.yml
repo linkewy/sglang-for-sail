@@ -102,7 +102,7 @@ jobs:
     container:
       image: ghcr.io/actions/actions-runner:latest
     env:
-      PPU_CI_RUNTIME_IMAGE: ${{ inputs.runtime_image || 'reg.docker.alibaba-inc.com/ai-tmp/llm:pytorch2.13.0-ubuntu24.04-cuda13.0-sglang0.5.18-py312-ppu202609291857' }}
+      PPU_CI_RUNTIME_IMAGE: ${{ inputs.runtime_image || 'reg.docker.alibaba-inc.com/ai-tmp/llm@sha256:83f3624dcdeb22f85a8608c5cb0fc1897dbd81ea442eec05f3da6095d71617a5' }}
       PPU_CI_TARGET_MODEL_PATH: ${{ inputs.target_model_path || '/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct' }}
       PPU_CI_EAGLE3_MODEL_PATH: ${{ inputs.eagle3_model_path || '/nas_aisw/datasets/checkpoints/LLM/lmsys/v3.1/sglang-EAGLE3-LLaMA3.1-Instruct-8B' }}
       PPU_CI_DFLASH_MODEL_PATH: ${{ inputs.dflash_model_path || '/nas_aisw/datasets/checkpoints/LLM/z-lab/v1.0/LLaMA3.1-8B-Instruct-DFlash-UltraChat' }}
