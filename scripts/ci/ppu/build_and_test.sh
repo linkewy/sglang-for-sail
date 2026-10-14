@@ -57,6 +57,10 @@ PY
         --wheel-dir "$wheel_dir/runtime-deps" \
         git+https://github.com/t-head/sailify.git@f401ecae76d7b4991d44920bde9edaac7e655fd8
     python3 -m pip install --no-deps --force-reinstall "$wheel_dir/runtime-deps/"*.whl
+    requirements=$(python3 "$checker" requirements)
+    mapfile -t eval_requirements <<< "$requirements"
+    python3 -m pip wheel --index-url https://pypi.org/simple --no-deps --no-build-isolation \
+        --wheel-dir "$wheel_dir/runtime-deps" "${eval_requirements[@]}"
     python3 "$checker" snapshot "$artifacts/build-dependencies.json"
 
     work=$(mktemp -d)
@@ -74,7 +78,16 @@ PY
     exit 0
 fi
 
-: "${PPU_CI_MODEL_PATH:?}"
+: "${PPU_CI_TARGET_MODEL_PATH:?}"
+: "${PPU_CI_EAGLE3_MODEL_PATH:?}"
+: "${PPU_CI_DFLASH_MODEL_PATH:?}"
+: "${PPU_CI_EVAL_CACHE:?}"
+export HOME
+HOME=$(mktemp -d)
+export HF_HOME="$HOME/hf-cache" HF_HUB_CACHE="$HOME/hf-cache/hub" HF_HUB_OFFLINE=1
+export UMD_ENABLE_COREDUMP_ON_EXCEPTION=1 UMD_ENABLE_LIGHTWEIGHT_COREDUMP=1
+mkdir -p "$artifacts/eval-results"
+ln -s "$artifacts/eval-results" "$HOME/.sgl_eval"
 python3 "$checker" snapshot "$artifacts/dependencies-before.json"
 finalize() {
     code=$?
@@ -88,6 +101,7 @@ finalize() {
     if ! (cd "$wheel_dir" && sha256sum -c SHA256SUMS); then
         code=1
     fi
+    printf '%s\n' "$code" > "$artifacts/exit-code.txt"
     exit "$code"
 }
 trap finalize EXIT
@@ -98,9 +112,11 @@ python3 "$repo/scripts/ci/ppu/check_ppu_environment.py"
 python3 -c 'import torch; print("Runtime Torch:", torch.__version__, "SAIL build marker:", getattr(torch.version, "sail", None)); assert torch.cuda.device_count() == 1'
 (cd "$wheel_dir" && sha256sum -c SHA256SUMS)
 python3 -m pip uninstall -y sgl-kernel
-python3 -m pip install --no-deps --force-reinstall "$wheel_dir/"*.whl
-if ! python3 -c 'from importlib.metadata import distribution; distribution("sailify")' >/dev/null 2>&1; then
-    python3 -m pip install --no-deps --no-index "$wheel_dir/runtime-deps/"*.whl
+python3 -m pip install --no-deps --no-index --force-reinstall "$wheel_dir/"*.whl
+missing_wheels=$(python3 "$checker" missing-wheels "$wheel_dir/runtime-deps")
+if [[ -n "$missing_wheels" ]]; then
+    mapfile -t runtime_wheels <<< "$missing_wheels"
+    python3 -m pip install --no-deps --no-index "${runtime_wheels[@]}"
 fi
 python3 "$checker" snapshot "$artifacts/dependencies-installed.json"
 python3 "$checker" check "$artifacts/dependencies-before.json" "$artifacts/dependencies-installed.json"
@@ -116,6 +132,7 @@ print("Runtime Torch:", torch.__version__, "SAIL build marker:", getattr(torch.v
 print("SGLang:", sglang.__file__)
 print("AOT extension:", sgl_kernel.common_ops.__file__)
 PY
+python3 "$repo/scripts/ci/ppu/prepare_runtime.py"
 
-cd "$repo/test"
-python3 run_suite.py --hw ppu --suite stage-a-test-1-gpu-ppu --timeout-per-file 1200
+cd "$artifacts"
+python3 "$repo/test/run_suite.py" --hw ppu --suite stage-a-test-1-gpu-ppu --timeout-per-file 1200

@@ -10,9 +10,25 @@ from pathlib import Path
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
 SCRIPT = Path(__file__).resolve().parents[3] / "scripts/ci/ppu/check_dependencies.py"
+ADDITIONS = {
+    "sailify": "1.0.0",
+    "sgl-eval": "0.1.2",
+    "math-verify": "0.9.0",
+    "latex2sympy2-extended": "1.11.0",
+    "antlr4-python3-runtime": "4.9.3",
+    "editdistance": "0.8.1",
+}
+WHEELS = {
+    "sailify": "sailify-1.0.0-py3-none-any.whl",
+    "sgl-eval": "sgl_eval-0.1.2-py3-none-any.whl",
+    "math-verify": "Math.Verify-0.9.0-py3-none-any.whl",
+    "latex2sympy2-extended": "latex2sympy2_extended-1.11.0-py3-none-any.whl",
+    "antlr4-python3-runtime": "antlr4_python3_runtime-4.9.3-1-py3-none-any.whl",
+    "editdistance": "editdistance-0.8.1-cp312-cp312-linux_x86_64.whl",
+}
 
 
 class TestPPUCIDependencies(CustomTestCase):
@@ -40,11 +56,26 @@ class TestPPUCIDependencies(CustomTestCase):
         result = self.check_snapshots(before, after)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_sailify_can_be_added_for_runtime_jit(self):
+    def test_pinned_runtime_additions_are_allowed(self):
         before = {"torch": {"version": "2.13.0", "record": "compatible"}}
-        after = {**before, "sailify": {"version": "1.0.0", "record": "converter"}}
+        after = {
+            **before,
+            **{
+                name: {"version": version, "record": "added"}
+                for name, version in ADDITIONS.items()
+            },
+        }
         result = self.check_snapshots(before, after)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_unpinned_runtime_additions_are_rejected(self):
+        for name, version in ADDITIONS.items():
+            with self.subTest(name=name):
+                result = self.check_snapshots(
+                    {}, {name: {"version": version + ".1", "record": "added"}}
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(name, result.stderr)
 
     def test_runtime_torch_cannot_be_replaced_by_build_torch(self):
         before = {"torch": {"version": "2.13.0", "record": "compatible"}}
@@ -66,17 +97,132 @@ class TestPPUCIDependencies(CustomTestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("Unexpected dependency changes", result.stderr)
 
-    def test_existing_sailify_cannot_be_replaced(self):
-        before = {"sailify": {"version": "1.0", "record": "vendor"}}
-        for after in (
-            {},
-            {"sailify": {"version": "1.1", "record": "vendor"}},
-            {"sailify": {"version": "1.0", "record": "different"}},
+    def test_existing_runtime_additions_cannot_be_replaced_or_removed(self):
+        for name, version in {**ADDITIONS, "sailify": "vendor-version"}.items():
+            before = {name: {"version": version, "record": "vendor"}}
+            with self.subTest(name=name, unchanged=True):
+                result = self.check_snapshots(before, before)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            for after in (
+                {},
+                {name: {"version": version + ".1", "record": "vendor"}},
+                {name: {"version": version, "record": "different"}},
+            ):
+                with self.subTest(name=name, after=after):
+                    result = self.check_snapshots(before, after)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(name, result.stderr)
+
+    def run_isolated_cli(self, command, installed=None, wheel_names=()):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            site = root / "site"
+            site.mkdir()
+            for name, version in (installed or {}).items():
+                info = site / f"{name.replace('-', '_')}-{version}.dist-info"
+                info.mkdir()
+                (info / "METADATA").write_text(f"Name: {name}\nVersion: {version}\n")
+                (info / "RECORD").write_text("preinstalled")
+            wheel_dir = root / "wheel house"
+            wheel_dir.mkdir()
+            for name in wheel_names:
+                (wheel_dir / name).touch()
+            args = [str(wheel_dir)] if command == "missing-wheels" else []
+            result = subprocess.run(
+                [sys.executable, "-S", str(SCRIPT), command, *args],
+                env={**os.environ, "PYTHONPATH": str(site)},
+                capture_output=True,
+                text=True,
+            )
+            return result, wheel_dir
+
+    def test_requirements_cli_emits_only_pinned_evaluators(self):
+        result, _ = self.run_isolated_cli(
+            "requirements", {"sailify": "vendor-version", "sgl-eval": "99.0.0"}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            "sgl-eval==0.1.2\n"
+            "math-verify==0.9.0\n"
+            "latex2sympy2-extended==1.11.0\n"
+            "antlr4-python3-runtime==4.9.3\n"
+            "editdistance==0.8.1\n",
+        )
+        self.assertEqual(result.stderr, "")
+
+    def test_missing_wheels_cli_selects_exact_normalized_pins(self):
+        result, wheel_dir = self.run_isolated_cli(
+            "missing-wheels",
+            wheel_names=[
+                *WHEELS.values(),
+                "sgl_eval-0.1.20-py3-none-any.whl",
+                "sgl_eval_extra-0.1.2-py3-none-any.whl",
+                "sgl_eval-0.1.2.tar.gz",
+                "torch-2.13.0-py3-none-any.whl",
+            ],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            "".join(f"{wheel_dir / name}\n" for name in WHEELS.values()),
+        )
+        self.assertEqual(result.stderr, "")
+
+    def test_missing_wheels_cli_skips_preinstalled_distributions(self):
+        for installed in (
+            {"Sailify": "vendor-version", "SGL.Eval": "0.1.2"},
+            {**ADDITIONS, "sailify": "vendor-version"},
         ):
-            with self.subTest(after=after):
-                result = self.check_snapshots(before, after)
+            with self.subTest(installed=installed):
+                missing = list(WHEELS.values())[2:] if "SGL.Eval" in installed else []
+                result, wheel_dir = self.run_isolated_cli(
+                    "missing-wheels", installed, missing
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    result.stdout, "".join(f"{wheel_dir / name}\n" for name in missing)
+                )
+                self.assertEqual(result.stderr, "")
+
+    def test_cli_rejects_preinstalled_evaluator_pin_conflicts(self):
+        for name, version in ADDITIONS.items():
+            if name == "sailify":
+                continue
+            with self.subTest(name=name):
+                result, _ = self.run_isolated_cli(
+                    "missing-wheels", {name: version + ".1"}, WHEELS.values()
+                )
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("sailify", result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(name, result.stderr)
+                self.assertIn(version + ".1", result.stderr)
+                self.assertIn(version, result.stderr)
+
+    def test_missing_wheels_cli_rejects_missing_or_wrong_pin(self):
+        for name, wheel in WHEELS.items():
+            for replacement in (None, wheel.replace(ADDITIONS[name], "99.0.0")):
+                with self.subTest(name=name, replacement=replacement):
+                    wheels = [value for value in WHEELS.values() if value != wheel]
+                    if replacement:
+                        wheels.append(replacement)
+                    result, _ = self.run_isolated_cli(
+                        "missing-wheels", wheel_names=wheels
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn(f"{name}=={ADDITIONS[name]}", result.stderr)
+
+    def test_missing_wheels_cli_rejects_duplicate_candidates(self):
+        for name, wheel in WHEELS.items():
+            with self.subTest(name=name):
+                result, _ = self.run_isolated_cli(
+                    "missing-wheels",
+                    wheel_names=[*WHEELS.values(), wheel.replace(".whl", "2.whl")],
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(f"{name}=={ADDITIONS[name]}", result.stderr)
 
     def test_snapshot_uses_first_distribution_on_python_path(self):
         with tempfile.TemporaryDirectory() as directory:

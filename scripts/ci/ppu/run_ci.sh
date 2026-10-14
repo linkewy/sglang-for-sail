@@ -8,16 +8,22 @@ exec > >(tee "$PPU_CI_ARTIFACT_DIR/ci.log") 2>&1
 
 : "${PPU_CI_BUILD_IMAGE:?Set the native cuda-free PPU build image on the runner}"
 : "${PPU_CI_RUNTIME_IMAGE:?Set the CUDA-compatible PPU runtime image on the runner}"
-: "${PPU_CI_MODEL_PATH:?Set the absolute path to the smoke model on the Docker host}"
+: "${PPU_CI_TARGET_MODEL_PATH:?Set the target checkpoint path on the Docker host}"
+: "${PPU_CI_EAGLE3_MODEL_PATH:?Set the EAGLE3 draft checkpoint path on the Docker host}"
+: "${PPU_CI_DFLASH_MODEL_PATH:?Set the DFlash draft checkpoint path on the Docker host}"
+: "${PPU_CI_EVAL_CACHE:?Set the shared sgl-eval 0.1.2 cache path on the Docker host}"
 PPU_CI_DEVICE=${PPU_CI_DEVICE:-${NVIDIA_VISIBLE_DEVICES:-}}
 if [[ ! "$PPU_CI_DEVICE" =~ ^[0-9]+$ ]]; then
     echo "PPU_CI_DEVICE must select exactly one numeric device" >&2
     exit 2
 fi
-[[ "$PPU_CI_MODEL_PATH" == /* && -f "$PPU_CI_MODEL_PATH/config.json" ]]
+for model in "$PPU_CI_TARGET_MODEL_PATH" "$PPU_CI_EAGLE3_MODEL_PATH" "$PPU_CI_DFLASH_MODEL_PATH"; do
+    [[ "$model" == /* && -f "$model/config.json" ]]
+done
+[[ "$PPU_CI_EVAL_CACHE" == /* && -f "$PPU_CI_EVAL_CACHE/mmlu/test.jsonl" ]]
 
 repo=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
-for path in "$repo" "$PPU_CI_MODEL_PATH" "$PPU_CI_ARTIFACT_DIR"; do
+for path in "$repo" "$PPU_CI_TARGET_MODEL_PATH" "$PPU_CI_EAGLE3_MODEL_PATH" "$PPU_CI_DFLASH_MODEL_PATH" "$PPU_CI_EVAL_CACHE" "$PPU_CI_ARTIFACT_DIR"; do
     if [[ "$path" == *,* ]]; then
         echo "Docker mount paths must not contain commas" >&2
         exit 2
@@ -56,7 +62,7 @@ git -C "$repo" diff HEAD > "$PPU_CI_ARTIFACT_DIR/source.patch"
 docker image inspect "$PPU_CI_BUILD_IMAGE" --format '{{.Id}}' > "$PPU_CI_ARTIFACT_DIR/build-image-id.txt"
 docker image inspect "$PPU_CI_RUNTIME_IMAGE" --format '{{.Id}}' > "$PPU_CI_ARTIFACT_DIR/runtime-image-id.txt"
 
-# Torch stays image-local; only SGL wheels and the JIT converter cross over.
+# Torch stays image-local; runtime additions never replace preinstalled dependencies.
 container="$container_prefix-build"
 docker run --rm --name "$container" --shm-size=16g \
     --mount "type=bind,source=$repo,target=/source,readonly" \
@@ -76,11 +82,17 @@ docker run --rm --name "$container" --shm-size=16g \
     --device="/dev/alixpu_ppu$PPU_CI_DEVICE" \
     --mount "type=bind,source=$repo,target=/source,readonly" \
     --mount "type=bind,source=$wheel_dir,target=/wheels,readonly" \
-    --mount "type=bind,source=$PPU_CI_MODEL_PATH,target=/models/model,readonly" \
+    --mount "type=bind,source=$PPU_CI_TARGET_MODEL_PATH,target=/models/target,readonly" \
+    --mount "type=bind,source=$PPU_CI_EAGLE3_MODEL_PATH,target=/models/eagle3,readonly" \
+    --mount "type=bind,source=$PPU_CI_DFLASH_MODEL_PATH,target=/models/dflash,readonly" \
+    --mount "type=bind,source=$PPU_CI_EVAL_CACHE,target=/eval-cache,readonly" \
     --mount "type=bind,source=$PPU_CI_ARTIFACT_DIR/runtime,target=/artifacts" \
     --env CUDA_VISIBLE_DEVICES=0 \
     --env PPU_CI_WHEEL_DIR=/wheels \
-    --env PPU_CI_MODEL_PATH=/models/model \
+    --env PPU_CI_TARGET_MODEL_PATH=/models/target \
+    --env PPU_CI_EAGLE3_MODEL_PATH=/models/eagle3 \
+    --env PPU_CI_DFLASH_MODEL_PATH=/models/dflash \
+    --env PPU_CI_EVAL_CACHE=/eval-cache \
     --env PPU_CI_ARTIFACT_DIR=/artifacts \
     --env SGLANG_IS_IN_CI=1 \
     --entrypoint bash "$PPU_CI_RUNTIME_IMAGE" /source/scripts/ci/ppu/build_and_test.sh test
