@@ -210,6 +210,7 @@ def inplace_fused_experts(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    fp8_use_rn_division: bool = False,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -244,6 +245,7 @@ def inplace_fused_experts(
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+        fp8_use_rn_division=fp8_use_rn_division,
     )
 
 
@@ -280,6 +282,7 @@ def outplace_fused_experts(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    fp8_use_rn_division: bool = False,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -314,6 +317,7 @@ def outplace_fused_experts(
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+        fp8_use_rn_division=fp8_use_rn_division,
     )
 
 
@@ -387,6 +391,7 @@ def fused_experts(
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
             a1_q=a1_q,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+            fp8_use_rn_division=moe_runner_config.fp8_use_rn_division,
         )
         if SGLANG_PROFILE_NVTX:
             th_nvtx_range_pop()
@@ -433,6 +438,7 @@ def fused_experts(
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
             a1_q=a1_q,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+            fp8_use_rn_division=moe_runner_config.fp8_use_rn_division,
         )
         if SGLANG_PROFILE_NVTX:
             th_nvtx_range_pop()
@@ -600,6 +606,7 @@ def _fused_moe_kernel_sequence(
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
     use_ppu_optimal_fusedmoe: bool = False,
+    fp8_use_rn_division: bool = False,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
@@ -624,6 +631,10 @@ def _fused_moe_kernel_sequence(
     if hooks and (hooks.after_gate_up is not None or hooks.after_down is not None):
         down_moe_use_tma = False
 
+    if fp8_use_rn_division and a1_q is not None:
+        raise ValueError(
+            "RN division cannot consume activations with unspecified pre-quantization rounding"
+        )
     if a1_q is not None:
         assert (
             use_fp8_w8a8
@@ -745,6 +756,7 @@ def _fused_moe_kernel_sequence(
             filter_expert=filter_expert,
             fuse_swiglu=fuse_swiglu_interleaved,
             use_valu=config.get("USE_VALU", False),
+            fp8_use_rn_division=fp8_use_rn_division,
         )
 
     if hooks and hooks.after_gate_up:
@@ -807,9 +819,23 @@ def _fused_moe_kernel_sequence(
                     gemm1_limit,
                 )
         elif gemm1_limit is not None:
-            intermediate_cache2 = _swiglu_silu_clamp_mul(
-                intermediate_cache1.view(-1, N), gemm1_limit
-            )
+            if (
+                _is_cuda
+                and intermediate_cache1.device.type == "cuda"
+                and intermediate_cache1.dtype == torch.bfloat16
+                and gemm1_limit == 7.0
+            ):
+                from sglang.kernels.ops.activation import silu_clamp_and_mul
+
+                # Keep SiLU/clamp/mul in FP32 until the final BF16 store,
+                # independently of whether torch.compile is enabled.
+                silu_clamp_and_mul(
+                    intermediate_cache1.view(-1, N), out=intermediate_cache2
+                )
+            else:
+                intermediate_cache2 = _swiglu_silu_clamp_mul(
+                    intermediate_cache1.view(-1, N), gemm1_limit
+                )
         elif swiglu_limit is not None:
             # DeepSeek V4: swiglu clamp before silu_and_mul.
             # Two paths gated by SGLANG_OPT_SWIGLU_CLAMP_FUSION:
@@ -1010,6 +1036,7 @@ def _fused_moe_kernel_sequence(
             fuse_sum_all_reduce=use_fused_moe_sum_all_reduce,
             router_topk=topk,
             use_valu=config.get("USE_VALU", False),
+            fp8_use_rn_division=fp8_use_rn_division,
         )
 
     if hooks and hooks.after_down:
@@ -1141,6 +1168,7 @@ def fused_experts_impl(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    fp8_use_rn_division: bool = False,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -1231,6 +1259,7 @@ def fused_experts_impl(
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
         use_ppu_optimal_fusedmoe=use_ppu_optimal_fusedmoe,
+        fp8_use_rn_division=fp8_use_rn_division,
     )
 
 
