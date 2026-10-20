@@ -6,6 +6,28 @@ import triton
 import triton.language as tl
 
 
+@triton.jit
+def _e4m3_to_bf16(bits):
+    """Decode E4M3FN bytes to BF16 with integer math (no native fp8 type).
+
+    ``tl.float8e4nv`` is unavailable before sm89, so the portable Triton
+    fallback reinterprets the SW128 compressed-index-key / query byte manually.
+    The widening is exact: E4M3FN's 3 mantissa bits fit inside BF16's 7. The
+    two NaN encodings (0x7F/0xFF) decode to +/-480, which never occurs for
+    real index keys.
+    """
+    b = bits.to(tl.int32)
+    sign = (b >> 7) & 1
+    exp = (b >> 3) & 0xF
+    man = (b & 0x7).to(tl.float32)
+    mantissa = tl.where(exp == 0, man * 0.125, 1.0 + man * 0.125)
+    exponent = tl.where(exp == 0, -6, exp - 7)
+    scale = ((exponent + 127) << 23).to(tl.float32, bitcast=True)
+    value = mantissa * scale
+    value = tl.where(sign == 1, -value, value)
+    return value.to(tl.bfloat16)
+
+
 @triton.jit(
     do_not_specialize=("REGIONS",),
     do_not_specialize_on_alignment=("REGIONS",),
@@ -32,11 +54,13 @@ def _score_regions(
     channel = tl.arange(0, 256)
     request = tl.load(RowToReq + row).to(tl.int64)
     position = tl.load(Positions + row)
-    query = tl.load(
-        Q + (row * HEADS + head[:, None]) * 256 + channel[None, :],
-        (request > 0) & (head[:, None] < HEADS),
-        other=0.0,
-    ).to(tl.bfloat16)
+    query = _e4m3_to_bf16(
+        tl.load(
+            Q + (row * HEADS + head[:, None]) * 256 + channel[None, :],
+            (request > 0) & (head[:, None] < HEADS),
+            other=0,
+        )
+    )
     weights = (
         tl.load(W + row * HEADS + head, (request > 0) & (head < HEADS), other=0).to(
             tl.float32
@@ -74,7 +98,7 @@ def _score_regions(
                 + channel[:, None] % 16
             )
             packed = tl.load(CompressedIndexKeys + offset, valid[None, :], other=0)
-            keys = packed.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
+            keys = _e4m3_to_bf16(packed)
             products = tl.dot(query, keys)
             score = tl.sum(tl.maximum(products, 0.0) * weights[:, None], axis=0)
             score = tl.where(valid, score, -float("inf"))
@@ -117,11 +141,13 @@ def _score_four_rows_per_request(
     # Verify metadata guarantees four consecutive rows for one request. Padding
     # groups carry request slot zero in all four rows.
     base_request = tl.load(RowToReq + group * 4).to(tl.int64)
-    query = tl.load(
-        Q + (query_row[:, None] * HEADS + head[:, None]) * 256 + channel[None, :],
-        (query_row[:, None] < ROWS) & (head[:, None] < HEADS) & (base_request > 0),
-        other=0.0,
-    ).to(tl.bfloat16)
+    query = _e4m3_to_bf16(
+        tl.load(
+            Q + (query_row[:, None] * HEADS + head[:, None]) * 256 + channel[None, :],
+            (query_row[:, None] < ROWS) & (head[:, None] < HEADS) & (base_request > 0),
+            other=0,
+        )
+    )
     weights = (
         tl.load(
             W + group_rows[:, None] * HEADS + tl.arange(0, 4)[None, :],
@@ -153,7 +179,7 @@ def _score_four_rows_per_request(
             + channel[:, None] % 16
         )
         packed = tl.load(CompressedIndexKeys + offset, valid[None, :], other=0)
-        keys = packed.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
+        keys = _e4m3_to_bf16(packed)
         products = tl.dot(query, keys)
         weighted = tl.maximum(products, 0.0) * tl.reshape(weights, (16, 1))
         region_scores = tl.sum(tl.reshape(weighted, (4, 4, BLOCK_R)), axis=1)
@@ -199,11 +225,13 @@ def _score_thirty_two_rows_per_request(
         position = tl.load(Positions + rows, row_valid, other=0)
         base_request = tl.load(RowToReq + group_base).to(tl.int64)
         query_row = group_base + subgroup * 8 + matrix_row // 4
-        query = tl.load(
-            Q + (query_row[:, None] * HEADS + head[:, None]) * 256 + channel[None, :],
-            (query_row[:, None] < ROWS) & (head[:, None] < HEADS) & (base_request > 0),
-            other=0.0,
-        ).to(tl.bfloat16)
+        query = _e4m3_to_bf16(
+            tl.load(
+                Q + (query_row[:, None] * HEADS + head[:, None]) * 256 + channel[None, :],
+                (query_row[:, None] < ROWS) & (head[:, None] < HEADS) & (base_request > 0),
+                other=0,
+            )
+        )
         weights = (
             tl.load(
                 W + rows[:, None] * HEADS + tl.arange(0, 4)[None, :],
@@ -235,7 +263,7 @@ def _score_thirty_two_rows_per_request(
                 + channel[:, None] % 16
             )
             packed = tl.load(CompressedIndexKeys + offset, valid[None, :], other=0)
-            keys = packed.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
+            keys = _e4m3_to_bf16(packed)
             products = tl.dot(query, keys)
             weighted = tl.maximum(products, 0.0) * tl.reshape(weights, (32, 1))
             # Preserve group1's 16-lane reduction; compact reduction changes rounding.

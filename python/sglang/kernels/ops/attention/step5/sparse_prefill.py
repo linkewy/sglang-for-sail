@@ -20,6 +20,15 @@ def use_sm100_sparse_prefill() -> bool:
     )
 
 
+def _can_use_sparse_prefill_cute(device: torch.device) -> bool:
+    """CuTe DSL sparse prefill needs sm90/sm100; other devices use the Triton path."""
+    return (
+        device.type == "cuda"
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability(device)[0] in (9, 10)
+    )
+
+
 def step5_sparse_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -123,6 +132,26 @@ def step5_sparse_prefill(
         ):
             raise ValueError(f"Step5 sparse prefill invalid {name}")
     if groups:
+        if not _can_use_sparse_prefill_cute(q.device):
+            from sglang.kernels.ops.attention.step5.sparse_prefill_triton import launch
+
+            launch(
+                q,
+                k,
+                v,
+                union_physical,
+                union_logical,
+                union_counts,
+                membership,
+                group_query_start,
+                group_query_end,
+                query_positions,
+                out,
+                lse,
+                softmax_scale=softmax_scale,
+            )
+            return
+
         from sglang.kernels.ops.attention.step5.cute.cute_utils import device_cache_key
         from sglang.kernels.ops.attention.step5.cute.prefill_dispatch import (
             compile_prefill,
