@@ -564,7 +564,14 @@ class Step5MoE(nn.Module):
             is_gated=True,
             gate_up_interleaved=False,
             fp8_use_rn_division=(
-                not self.keep_bf16_experts and get_moe_runner_backend().is_triton()
+                # RN (round-to-nearest) division is an FP8 block-wise accuracy
+                # feature: invoke_fused_moe_kernel rejects it unless the MoE is
+                # CUDA block-wise FP8. Keep it off for INT8 (compressed-tensors
+                # W8A8), nvfp4, per-tensor FP8, and BF16 routed experts.
+                not self.keep_bf16_experts
+                and isinstance(quant_config, Fp8Config)
+                and getattr(quant_config, "weight_block_size", None) is not None
+                and get_moe_runner_backend().is_triton()
             ),
             quant_method=quant_method,
             routing_method_type=RoutingMethodType.SigmoidBiasOrderedRenorm
