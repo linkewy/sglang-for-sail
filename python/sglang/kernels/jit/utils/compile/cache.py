@@ -56,7 +56,12 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import msgspec
 
 from sglang.kernels.jit.utils.arch import get_jit_cuda_arch
-from sglang.kernels.jit.utils.common import cache_once, is_hip_runtime, is_musa_runtime
+from sglang.kernels.jit.utils.common import (
+    cache_once,
+    is_hip_runtime,
+    is_musa_runtime,
+    is_ppu_runtime,
+)
 from sglang.kernels.jit.utils.compile import toolchain
 from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
 from sglang.kernels.jit.utils.compile.spec import BuildSpec
@@ -214,6 +219,8 @@ def _target_tag() -> str:
     ``(major, minor)`` capability: the latter maps gfx940/gfx941/gfx942 onto a
     single ``9.4``, which are three different compile targets.
     """
+    if is_ppu_runtime():
+        return f"ppu_{toolchain.ppu_gpu_arch()}"
     if is_hip_runtime():
         return toolchain.gpu_arch_name().split(":")[0] or "unknown"
     arch = get_jit_cuda_arch()
@@ -232,7 +239,12 @@ def _environment_fingerprint() -> str:
     different host compiler means different system headers and different host
     codegen for otherwise identical inputs.
     """
-    if is_hip_runtime():
+    if is_ppu_runtime():
+        # Import lazily: sailify's mirror digest also uses this module's file digest.
+        from sglang.kernels.jit.utils.compile.sailify import sailify_version
+
+        target = f"hgcc:{toolchain.ppu_gpu_arch()}:sailify-{sailify_version()}"
+    elif is_hip_runtime():
         target = f"hip:{toolchain.gpu_arch_name()}"
     else:
         arch = get_jit_cuda_arch()

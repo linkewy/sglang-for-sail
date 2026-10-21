@@ -22,9 +22,64 @@ from typing import List, Tuple
 import torch
 
 from sglang.kernels.jit.utils.arch import get_jit_cuda_arch
-from sglang.kernels.jit.utils.common import cache_once, is_hip_runtime
+from sglang.kernels.jit.utils.common import cache_once, is_hip_runtime, is_ppu_runtime
 
 logger = logging.getLogger(__name__)
+
+_PPU_GPU_ARCHS = (
+    "native",
+    "all",
+    "all-ppu",
+    "all-vm",
+    "ppu_10",
+    "ppu_15",
+    "vm_10",
+    "vm_15",
+)
+
+
+def ppu_gpu_arch() -> str:
+    """Read the target directly from the environment, leaving config unchanged."""
+    arch = os.environ.get("SGLANG_PPU_GPU_ARCH", "native")
+    if arch not in _PPU_GPU_ARCHS:
+        raise ValueError(
+            f"Invalid SGLANG_PPU_GPU_ARCH={arch!r}; expected one of "
+            f"{', '.join(_PPU_GPU_ARCHS)}"
+        )
+    return arch
+
+
+@cache_once
+def hgcc_path() -> str:
+    """Locate hgcc on PATH or in a PPU SDK installation."""
+    searched = ["hgcc on PATH"]
+    on_path = shutil.which("hgcc")
+    if on_path is not None:
+        return on_path
+    for root in (
+        os.environ.get("PPU_SDK"),
+        os.environ.get("PPU_HOME"),
+        "/usr/local/PPU_SDK",
+    ):
+        if root is None:
+            continue
+        candidate = os.path.join(root, "bin", "hgcc")
+        searched.append(candidate)
+        if os.path.isfile(candidate):
+            return candidate
+    raise RuntimeError(
+        "JIT builds on PPU require the hgcc compiler. Searched: " + ", ".join(searched)
+    )
+
+
+@cache_once
+def ppu_sdk_home() -> str:
+    """Locate the PPU runtime and driver libraries for the device compiler."""
+    return (
+        os.environ.get("PPU_SDK")
+        or os.environ.get("PPU_HOME")
+        or os.path.dirname(os.path.dirname(hgcc_path()))
+    )
 
 
 @cache_once
@@ -69,6 +124,8 @@ def device_compiler_path() -> str:
     Resolved the same way tvm-ffi resolves it, so the binary the cache
     fingerprints is the binary that does the compiling.
     """
+    if is_ppu_runtime():
+        return hgcc_path()
     if is_hip_runtime():
         return os.path.join(rocm_home(), "bin", "hipcc")
     return os.path.join(cuda_home(), "bin", "nvcc")
@@ -129,6 +186,8 @@ def target_flags() -> List[str]:
     the compiler driver to probe: the value is part of the cache key, so it has
     to be decided here and not rediscovered at build time.
     """
+    if is_ppu_runtime():
+        return [f"--gpu-architecture={ppu_gpu_arch()}"]
     if is_hip_runtime():
         return [f"--offload-arch={gpu_arch_name()}"]
     arch = get_jit_cuda_arch()
@@ -170,6 +229,9 @@ def base_link_flags(*, with_device: bool) -> List[str]:
     flags = ["-shared", f"-L{lib_dir}", f"-l{lib_name}"]
     if not with_device:
         return flags
+    if is_ppu_runtime():
+        # The runtime exports hggc* and fatbinary registration; the driver exports hg*.
+        return flags + [f"-L{ppu_sdk_home()}/lib", "-lhggcrt1", "-lhggc"]
     if is_hip_runtime():
         return flags + [f"-L{rocm_home()}/lib", "-lamdhip64"]
     return flags + [f"-L{cuda_home()}/lib64", "-lcudart"]
