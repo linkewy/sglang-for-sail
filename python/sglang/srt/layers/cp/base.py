@@ -30,6 +30,7 @@ from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.common import is_ppu
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -261,6 +262,14 @@ def init_cp_strategy(
         return
 
     kind = ContextParallelStrategyKind.from_string(cp_strategy)
+    if is_ppu() and kind != ContextParallelStrategyKind.INTERLEAVE:
+        # PPU only runs the interleave (DSA) V2 strategy; zigzag drives
+        # FlashAttention-style backends that PPU does not provide, so
+        # non-interleave prefill CP stays on the legacy shared V1 path with
+        # a dormant strategy there.
+        _STRATEGY = None
+        return
+
     if kind == ContextParallelStrategyKind.ZIGZAG:
         from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 

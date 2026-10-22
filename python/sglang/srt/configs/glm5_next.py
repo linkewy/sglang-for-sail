@@ -262,8 +262,19 @@ class Glm5NextTextConfig(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self) -> KimiLinearCacheParams:
+        # Under prefill CP, attn_tp_size collapses to 1, which would size the
+        # mamba/KDA state for the whole machine and duplicate it across CP ranks.
+        # Shard the state by attn_cp_size instead so it fits the KV cache budget.
+        from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+
+        head_shard_size = (
+            get_parallel().attn_cp_size
+            if is_dsa_enable_prefill_cp()
+            else get_parallel().attn_tp_size
+        )
+
         shape = KimiLinearStateShape.create(
-            tp_world_size=get_parallel().attn_tp_size,
+            tp_world_size=head_shard_size,
             num_heads=self.linear_attn_config["num_heads"],
             head_dim=self.linear_attn_config["head_dim"],
             conv_kernel_size=self.linear_attn_config["short_conv_kernel_size"],

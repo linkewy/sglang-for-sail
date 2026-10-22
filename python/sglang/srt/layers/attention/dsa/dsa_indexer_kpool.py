@@ -21,6 +21,7 @@ from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
     dsa_use_prefill_cp,
+    is_dsa_enable_prefill_cp,
 )
 from sglang.srt.layers.attention.mqa_logits_utils import (
     MQA_LOGITS_BYTES_PER_ELEM,
@@ -32,7 +33,16 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
 )
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
+from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
+from sglang.srt.utils import (
+    add_prefix,
+    ceil_align,
+    get_device_sm,
+    is_cuda,
+    is_hip,
+    is_npu,
+    is_ppu,
+)
 
 if is_cuda():
     try:
@@ -46,6 +56,7 @@ if is_npu():
     except ImportError:
         pass
 
+from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -62,7 +73,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.runner_utils import capture_mode
-from sglang.srt.runtime_context import get_device, get_exec
+from sglang.srt.runtime_context import get_device, get_exec, get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +91,14 @@ def _slice_rows(
     *, tensor: Optional[torch.Tensor], rows: slice
 ) -> Optional[torch.Tensor]:
     return None if tensor is None else tensor[rows]
+
+
+def _kpool_act_quant_int8(
+    x: torch.Tensor, block_size=None, scale_fmt=None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # PPU int8: act_quant replacement on PPU 1.0/1.1 (SM80); the fp8 quantizer's
+    # block_size / scale_fmt are ignored, per-token int8 quantization is used.
+    return per_token_quant_int8(x)
 
 
 def _mqa_logits_row_chunks(
@@ -158,6 +177,9 @@ class IndexerKPool(MultiPlatformOp):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.compress_gate_stream = None
+        # Context-parallel attributes used by the skip guard and write-side gather.
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        self.cp_size = get_parallel().attn_cp_size if self.dsa_enable_prefill_cp else 1
         self.skip_rope = skip_rope
 
         self.index_kpool = config.index_kpool
@@ -236,6 +258,15 @@ class IndexerKPool(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
+        # PPU int8: PPU 1.0/1.1 (SM80) cannot run DeepGEMM's fp8 indexer path;
+        # select the int8 variant, mirroring dsa_indexer.py's use_int8 flag.
+        self.use_fp8 = 0
+        self.use_int8 = 0
+        if get_device_sm() < 89 and is_ppu():
+            self.use_int8 = 1
+        else:
+            self.use_fp8 = 1
+
     @torch.compile(dynamic=True)
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
         weights, _ = self.weights_proj(x.float())
@@ -273,6 +304,37 @@ class IndexerKPool(MultiPlatformOp):
             and not dsa_use_prefill_cp(forward_batch)
         )
 
+    # Write-side prefill CP: all-gather local-row key/gate_score back to full rows,
+    # since compress-write chunk_src uses full-row indices.
+    @staticmethod
+    def _cp_gather_concat(
+        tensors: List[torch.Tensor],
+        cp_size: int,
+        forward_batch: ForwardBatch,
+    ) -> List[torch.Tensor]:
+        if not tensors:
+            return []
+        n_local = tensors[0].shape[0]
+        flats = []
+        feature_sizes = []
+        tails = []
+        for tensor in tensors:
+            assert tensor.shape[0] == n_local
+            assert tensor.dtype == tensors[0].dtype
+            tails.append(tensor.shape[1:])
+            flat = tensor.reshape(n_local, -1).contiguous()
+            feature_sizes.append(flat.shape[1])
+            flats.append(flat)
+        combined = flats[0] if len(flats) == 1 else torch.cat(flats, dim=1)
+        gathered = cp_all_gather_rerange_output(
+            combined,
+            cp_size,
+            forward_batch,
+            torch.cuda.current_stream(),
+        )
+        parts = torch.split(gathered, feature_sizes, dim=1)
+        return [part.reshape(part.shape[0], *tail) for part, tail in zip(parts, tails)]
+
     @staticmethod
     def _get_index_k_read_buffer(pool, layer_id: int) -> torch.Tensor:
         if hasattr(pool, "get_broadcastable_index_k_with_scale_buffer"):
@@ -297,7 +359,7 @@ class IndexerKPool(MultiPlatformOp):
                 return (
                     torch.empty(
                         (0, self.head_dim),
-                        dtype=torch.float8_e4m3fn,
+                        dtype=torch.int8 if self.use_int8 else torch.float8_e4m3fn,
                         device=slot_k.device,
                     ),
                     torch.empty((0,), dtype=torch.float32, device=slot_k.device),
@@ -389,6 +451,7 @@ class IndexerKPool(MultiPlatformOp):
             import os
 
             from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
+                all_gather_and_scatter_pool_slots,
                 kpool_assemble_softmax_rotate_write_cache,
                 scatter_kpool_tail_updates,
             )
@@ -396,15 +459,28 @@ class IndexerKPool(MultiPlatformOp):
             pool = get_token_to_kv_pool()
             if hasattr(pool, "invalidate_index_buffer_for_layer"):
                 pool.invalidate_index_buffer_for_layer(layer_id)
+            # Layer sharding: skip the kpool write for layers not owned by this rank.
+            layer_owned = not (
+                hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id)
+            )
+            if not layer_owned:
+                return None
 
-            writes, tails = plan.writes, plan.tails
+            writes, tails, cp = plan.writes, plan.tails, plan.cp
             if writes.is_empty and tails.is_empty:
                 return None
 
             tail_k_buf, tail_score_buf = pool.get_compress_tail_buffers(layer_id)
+            # CP write-mask/scatter context; layer-sharded pools bypass CP masking.
+            layer_sharded = bool(getattr(pool, "layer_shard_enabled", False))
+            cache_cp = None if layer_sharded else cp
             if os.environ.get("SGLANG_DSA_KPOOL_DEBUG_BOUNDS") == "1":
                 if not writes.is_empty:
-                    active = torch.ones_like(writes.req, dtype=torch.bool)
+                    active = (
+                        cache_cp.local_write_mask
+                        if cache_cp is not None
+                        else torch.ones_like(writes.req, dtype=torch.bool)
+                    )
                     if bool(active.any().item()):
                         active_req = writes.req[active]
                         active_write_loc = writes.write_loc[active]
@@ -440,7 +516,9 @@ class IndexerKPool(MultiPlatformOp):
                                 f"{key.shape=}, {gate_score.shape=}, {tail_k_buf.shape=}, "
                                 f"{pool.get_index_k_with_scale_buffer(layer_id=layer_id).shape=}, "
                                 f"{min_chunk=}, {max_chunk=}, {min_req=}, {max_req=}, "
-                                f"{min_loc=}, {max_loc=}, {pool.slots_per_page=}"
+                                f"{min_loc=}, {max_loc=}, {pool.slots_per_page=}, "
+                                f"cp_rank={cache_cp.rank if cache_cp is not None else None}, "
+                                f"cp_size={cache_cp.size if cache_cp is not None else None}"
                             )
                 if not tails.is_empty:
                     tail_chunk_max = tails.chunk_src.to(torch.long) + torch.clamp(
@@ -477,8 +555,22 @@ class IndexerKPool(MultiPlatformOp):
                     tail_logical_base=writes.tail_logical_base,
                     ape=self.index_kpool_compress_ape,
                     loc=writes.write_loc,
+                    # CP local write mask: each rank writes only the slots it owns.
+                    write_mask=(
+                        cache_cp.local_write_mask if cache_cp is not None else None
+                    ),
                     round_scale=self.scale_fmt is not None,
                 )
+                # After the CP write, all-gather+scatter so every rank holds the full buf.
+                if cache_cp is not None and write_cache:
+                    all_gather_and_scatter_pool_slots(
+                        buf=buf,
+                        local_locs=writes.write_loc,
+                        owner_rank=cache_cp.owner_rank,
+                        cp_size=cache_cp.size,
+                        cp_rank=cache_cp.rank,
+                        slots_per_page=pool.slots_per_page,
+                    )
 
             if not tails.is_empty:
                 scatter_kpool_tail_updates(
@@ -881,8 +973,8 @@ class IndexerKPool(MultiPlatformOp):
             return None, attn_metadata.topk_indices_offset, None
         return None, None, None
 
-    @staticmethod
     def _fp8_mqa_logits(
+        self,
         q_fp8: torch.Tensor,
         k_fp8: torch.Tensor,
         k_scale: torch.Tensor,
@@ -893,6 +985,17 @@ class IndexerKPool(MultiPlatformOp):
         clean_logits: bool,
     ) -> torch.Tensor:
         """Ragged MQA logits: DeepGEMM on CUDA, AITER's Triton kernel on ROCm."""
+        # PPU int8: PPU 1.0/1.1 (SM80) cannot run DeepGEMM's fp8 MQA logits; use
+        # the int8 shim instead. Instance method now, to read self.use_int8.
+        if self.use_int8:
+            return deep_gemm.int8_mqa_logits(
+                q_fp8,
+                (k_fp8, k_scale),
+                weights,
+                starts,
+                ends,
+                clean_logits=clean_logits,
+            )
         if is_hip():
             from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
@@ -1042,7 +1145,14 @@ class IndexerKPool(MultiPlatformOp):
                 clean_logits=False,
             )
         else:
-            logits = deep_gemm.fp8_paged_mqa_logits(
+            # PPU int8: PPU 1.0/1.1 (SM80) cannot run DeepGEMM's fp8 paged MQA
+            # logits; the int8 variant is structurally identical on this path.
+            paged_mqa_logits = (
+                deep_gemm.int8_paged_mqa_logits
+                if self.use_int8
+                else deep_gemm.fp8_paged_mqa_logits
+            )
+            logits = paged_mqa_logits(
                 q_fp8.unsqueeze(1),
                 kv_cache_fp8,
                 weights,
@@ -1184,7 +1294,7 @@ class IndexerKPool(MultiPlatformOp):
                 k_out=k_u8,
                 scale_out=k_scale,
             )
-            k_fp8 = k_u8.view(torch.float8_e4m3fn)
+            k_fp8 = k_u8.view(torch.int8 if self.use_int8 else torch.float8_e4m3fn)
             kv_fp8 = (k_fp8.contiguous(), k_scale.contiguous())
 
         topk_method = metadata.topk_transform_method
@@ -1380,7 +1490,9 @@ class IndexerKPool(MultiPlatformOp):
                             curr_k_fp8.view(torch.uint8)
                         )
                         k_scale[curr_pool_start:pool_seq_len].copy_(curr_k_scale)
-                        k_fp8 = k_u8.view(torch.float8_e4m3fn)
+                        k_fp8 = k_u8.view(
+                            torch.int8 if self.use_int8 else torch.float8_e4m3fn
+                        )
                     else:
                         k_fp8 = curr_k_fp8
                         k_scale = curr_k_scale
@@ -1409,7 +1521,9 @@ class IndexerKPool(MultiPlatformOp):
                         pool_seq_len,
                         pool_seq_len,
                     )
-                    k_fp8 = k_fp8.view(torch.float8_e4m3fn)
+                    k_fp8 = k_fp8.view(
+                        torch.int8 if self.use_int8 else torch.float8_e4m3fn
+                    )
                     k_scale = k_scale.view(torch.float32).squeeze(-1)
                 row_starts = (
                     zero_starts_by_batch[i]
@@ -1595,6 +1709,7 @@ class IndexerKPool(MultiPlatformOp):
                 write_loc=plan.write_loc,
                 out_cache_loc=forward_batch.out_cache_loc,
                 num_draft_tokens=num_draft_tokens,
+                plan_bs=plan.plan_bs,
                 round_scale=self.scale_fmt is not None,
                 effective_n_per_batch=plan.effective_n_per_batch,
             )
@@ -1666,7 +1781,10 @@ class IndexerKPool(MultiPlatformOp):
         layer_id: int,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        if is_hip():
+        # PPU int8: route act_quant through the per-token int8 shim on PPU 1.0/1.1.
+        if self.use_int8:
+            act_quant = _kpool_act_quant_int8
+        elif is_hip():
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
         elif not is_npu():
             from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
@@ -1725,7 +1843,8 @@ class IndexerKPool(MultiPlatformOp):
                 max_kv_len = forward_batch.seq_lens_cpu.max().item()
                 skip_logits_computation = max_kv_len <= self.index_topk
 
-        if skip_logits_computation:
+        # CP keeps full-sequence topk semantics, so logits cannot be skipped when CP is on.
+        if skip_logits_computation and (not self.dsa_enable_prefill_cp):
             return self._forward_cuda_skip_logits(
                 x,
                 positions,
@@ -1752,6 +1871,15 @@ class IndexerKPool(MultiPlatformOp):
             precompute_compress_gate=precompute_compress_gate,
             precompute_head_gate=enable_dual_stream and return_indices,
         )
+        # Prefill CP: query stays local-row but compress-write chunk_src is full-row,
+        # so all-gather key/gate_score to full rows to avoid out-of-bounds kernel reads.
+        use_cp = dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
+        if use_cp:
+            if gate_score is None:
+                gate_score = self._compute_gate_score_if_missing(x, gate_score)
+            key, gate_score = self._cp_gather_concat(
+                [key, gate_score], self.cp_size, forward_batch
+            )
 
         has_kpool_extend_plan = metadata.attn_metadata.kpool_extend_plan is not None
         is_prefill = forward_batch.forward_mode.is_extend_without_speculative()
