@@ -152,7 +152,7 @@ def step5_sparse_decode_partials(
 ) -> None:
     """Write BF16 final output or FP32 split partials with FP32 natural LSE.
 
-    Q is [T,H,192], H in (8,16); native contiguous K/V are [slots,1,192], page64-aligned.
+    Q is [T,H,192], H in (4,8,16); native contiguous K/V are [slots,1,192], page64-aligned.
     The page16 views share storage, addresses and token numbering with native KV.
     Counts and causal lengths are int32 [T]; packed int64 regions [T,513/514/516]
     come from step5_pack_decode_regions. Counts outside valid_rows[0] must be
@@ -174,8 +174,8 @@ def step5_sparse_decode_partials(
     """
     if q.device.type != "cuda" or torch.version.hip is not None:
         raise ValueError("Step5 sparse decode requires NVIDIA CUDA")
-    if q.ndim != 3 or q.shape[1] not in (8, 16) or q.shape[2] != 192:
-        raise ValueError("Step5 Q requires shape [T,8 or 16,192]")
+    if q.ndim != 3 or q.shape[1] not in (4, 8, 16) or q.shape[2] != 192:
+        raise ValueError("Step5 Q requires shape [T,4/8/16,192]")
     rows, heads, _ = q.shape
     if not 1 <= mtp_q_len <= 16:
         raise ValueError("Step5 mtp_q_len must be in [1,16]")

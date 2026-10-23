@@ -48,7 +48,7 @@ def step5_sparse_prefill(
 ) -> None:
     """Write BF16 attention and FP32 natural LSE for exact sparse unions.
 
-    Q/out are [T,H,192], H in (8,16); native contiguous K/V are [slots,1,192], page64-aligned.
+    Q/out are [T,H,192], H in (4,8,16); native contiguous K/V are [slots,1,192], page64-aligned.
     Metadata comes from step5_build_prefill_union: int32 physical/logical region
     IDs and membership [G,C], counts [G], and packed-query start/end [G]. Logical
     IDs identify eight-token regions. Bit j selects the j-th query in a group.
@@ -99,8 +99,8 @@ def step5_sparse_prefill(
 
     if q.device.type != "cuda" or torch.version.hip is not None:
         raise ValueError("Step5 sparse prefill requires NVIDIA CUDA")
-    if q.ndim != 3 or q.shape[1] not in (8, 16) or q.shape[2] != 192:
-        raise ValueError("Step5 Q requires shape [T,8 or 16,192]")
+    if q.ndim != 3 or q.shape[1] not in (4, 8, 16) or q.shape[2] != 192:
+        raise ValueError("Step5 Q requires shape [T,4/8/16,192]")
     if k.ndim != 3 or tuple(k.shape[1:]) != (1, 192) or k.shape[0] % 64:
         raise ValueError("Step5 K requires page64-aligned native [slots,1,192]")
     if union_physical.ndim != 2 or not 1 <= union_physical.shape[1] <= 16 * 513:
