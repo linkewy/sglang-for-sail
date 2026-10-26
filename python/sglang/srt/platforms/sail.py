@@ -47,5 +47,3 @@ class SailSRTPlatform(SailDeviceMixin, SRTPlatform):
 # into the respective attention backends transparently.
 if is_sail_available():
     import sglang.srt.hardware_backend.sail.attention.sail_dsa_hooks  # noqa: F401
-    import sglang.srt.hardware_backend.sail.attention.sail_fa3_hooks  # noqa: F401
-    import sglang.srt.hardware_backend.sail.attention.sail_flashmla_hooks  # noqa: F401

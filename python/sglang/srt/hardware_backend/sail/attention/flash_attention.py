@@ -121,6 +121,11 @@ def flash_attn_with_kvcache(
             "flash_attn_with_kvcache not implemented."
         )
 
+    if qv is not None:
+        raise NotImplementedError(
+            "q_v is not supported by SAIL FA3; use FlashMLA for MLA models."
+        )
+
     attention_chunk = 0 if attention_chunk is None else int(attention_chunk)
 
     return _fa_with_kvcache(
@@ -203,10 +208,13 @@ def flash_attn_varlen_func(
             "flash_attn_varlen_func not implemented."
         )
 
-    if softmax_scale is None:
-        softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (
-            -0.5
+    if qv is not None:
+        raise NotImplementedError(
+            "q_v is not supported by SAIL FA3; use FlashMLA for MLA models."
         )
+
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
 
     attention_chunk = 0 if attention_chunk is None else int(attention_chunk)
 

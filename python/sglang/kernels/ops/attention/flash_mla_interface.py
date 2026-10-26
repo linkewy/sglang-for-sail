@@ -14,8 +14,16 @@ from typing import Optional, Tuple, Union
 
 import flash_mla
 import torch
-from flash_mla import fused_norm_rope_attn_rope_cast as _mega
-from flash_mla.flash_mla_interface import FlashMLASchedMeta
+
+try:
+    from flash_mla import fused_norm_rope_attn_rope_cast as _mega
+except ImportError:
+    _mega = None
+
+try:
+    from flash_mla.flash_mla_interface import FlashMLASchedMeta
+except ImportError:
+    from flash_mla import FlashMLASchedMeta
 
 # 512 fp8 values + 4 fp32 scales; the V4.1 formats have the same size, which is
 # why the tensor-metadata API (it predates V4.1) reads such a cache as V3.2.
@@ -38,6 +46,18 @@ _MEGA_FIXED_PARAMS = dict(
 SPLIT_KV_MIN_TOPK = 641
 
 
+def _sail_ops():
+    # Lazy import avoids a platform/runtime-context dependency during module
+    # discovery, while still routing every FlashMLA consumer (dense and DSA).
+    from sglang.srt.runtime_context import get_platform
+
+    if not get_platform().is_sail:
+        return None
+    from sglang.srt.hardware_backend.sail.attention import flash_mla
+
+    return flash_mla
+
+
 def get_mla_metadata(
     cache_seqlens: Optional[torch.Tensor] = None,
     num_q_tokens_per_head_k: Optional[int] = None,
@@ -48,6 +68,16 @@ def get_mla_metadata(
 ) -> Tuple[Union[torch.Tensor, FlashMLASchedMeta], Optional[torch.Tensor]]:
     """Without ``cache_seqlens``, an empty ``FlashMLASchedMeta`` that the first
     decode call fills; with it, the legacy split-KV schedule as tensors."""
+    sail_ops = _sail_ops()
+    if sail_ops is not None:
+        return sail_ops.get_mla_metadata(
+            cache_seqlens,
+            num_q_tokens_per_head_k,
+            num_heads_k,
+            num_heads_q=num_heads_q,
+            is_fp8_kvcache=is_fp8_kvcache,
+            topk=topk,
+        )
     if cache_seqlens is None:
         return flash_mla.get_mla_metadata()[0], None
     assert num_q_tokens_per_head_k is not None
@@ -90,6 +120,29 @@ def flash_mla_with_kvcache(
     or the schedule tensors from ``get_mla_metadata(cache_seqlens, ...)`` with
     ``num_splits``, which ride on a fresh ``FlashMLASchedMeta`` (legacy only:
     V3.2 sparse, dense bf16, or dense fp8 when ``q`` is fp8)."""
+    sail_ops = _sail_ops()
+    if sail_ops is not None:
+        return sail_ops.flash_mla_with_kvcache(
+            q=q,
+            k_cache=k_cache,
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
+            head_dim_v=head_dim_v,
+            tile_scheduler_metadata=tile_scheduler_metadata,
+            num_splits=num_splits,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            descale_q=descale_q,
+            descale_k=descale_k,
+            is_fp8_kvcache=is_fp8_kvcache,
+            indices=indices,
+            attn_sink=attn_sink,
+            extra_k_cache=extra_k_cache,
+            extra_indices_in_kvcache=extra_indices_in_kvcache,
+            topk_length=topk_length,
+            extra_topk_length=extra_topk_length,
+            kv_format=kv_format,
+        )
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     if isinstance(tile_scheduler_metadata, FlashMLASchedMeta):
@@ -155,6 +208,17 @@ def flash_mla_sparse_fwd(
     """Sparse prefill over a bf16 ``kv``: (output, max_logits, lse). The legacy
     kernel's statistics are base 2, as sgl-kernel returned them; the current
     kernel's are natural-log."""
+    sail_ops = _sail_ops()
+    if sail_ops is not None:
+        return sail_ops.flash_mla_sparse_fwd(
+            q,
+            kv,
+            indices,
+            sm_scale,
+            d_v=d_v,
+            attn_sink=attn_sink,
+            topk_length=topk_length,
+        )
     return flash_mla.flash_mla_sparse_fwd(
         q,
         kv,
@@ -183,6 +247,10 @@ def flash_mla_mega_prefill(
     use_legacy: bool = True,
 ) -> Tuple[torch.Tensor, ...]:
     """MegaAttention prefill over a bf16 ``kv``: (out_fp8, out_sf, max_logits, lse)."""
+    if _mega is None:
+        raise NotImplementedError(
+            "MegaAttention is unavailable in the installed flash_mla package."
+        )
     return _mega.prefill(
         token_positions=positions,
         cos_sin_cache=cos_sin_cache,
@@ -218,6 +286,10 @@ def flash_mla_mega_decode(
     use_legacy: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """MegaAttention decode over a paged cache: (out_fp8, out_sf, lse)."""
+    if _mega is None:
+        raise NotImplementedError(
+            "MegaAttention is unavailable in the installed flash_mla package."
+        )
     return _mega.decode(
         token_positions=positions,
         cos_sin_cache=cos_sin_cache,

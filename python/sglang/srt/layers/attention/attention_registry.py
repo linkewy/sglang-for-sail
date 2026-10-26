@@ -231,6 +231,12 @@ def create_flex_attention_backend(runner):
 
 @register_attention_backend("flashmla")
 def create_flashmla_backend(runner):
+    if _is_sail:
+        from sglang.srt.hardware_backend.sail.attention.flashmla_backend import (
+            SailFlashMLABackend,
+        )
+
+        return SailFlashMLABackend(runner)
     from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
     return FlashMLABackend(runner)
@@ -240,13 +246,22 @@ def create_flashmla_backend(runner):
 def create_flashattention_v3_backend(runner):
 
     major, minor = get_device_capability()
+    if _is_sail and runner.use_mla_backend:
+        raise ValueError(
+            "SAIL FA3 cannot serve MLA: the vendor kernel supports neither q_v "
+            "nor the materialized 576-wide MLA head. Use --attention-backend flashmla."
+        )
     if not _is_musa:
-        assert (
-            major == 8 and (_is_sail or not runner.use_mla_backend)
-        ) or major == 9, (
+        assert (major == 8 and not runner.use_mla_backend) or major == 9, (
             "FlashAttention v3 Backend requires SM>=80 and SM<=90. "
             "Please use `--attention-backend flashinfer`."
         )
+        if _is_sail:
+            from sglang.srt.hardware_backend.sail.attention.flashattention_backend import (
+                SailFlashAttentionBackend,
+            )
+
+            return SailFlashAttentionBackend(runner)
         from sglang.srt.layers.attention.flashattention_backend import (
             FlashAttentionBackend,
         )
@@ -484,7 +499,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 ), (
                     "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
                 )
-            logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
+            logger.info("Using hybrid linear attention backend for hybrid GDN models.")
             linear_attn_backend = GDNAttnBackend(runner)
             from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
 
