@@ -640,6 +640,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
 
 class FlashMLAMultiStepDraftBackend:
+    backend_cls = FlashMLABackend
+
     # Read by decide_needs_cpu_seq_lens (getattr defaults missing flags to True).
     needs_cpu_seq_lens: bool = False
 
@@ -669,7 +671,7 @@ class FlashMLAMultiStepDraftBackend:
         self.attn_backends = []
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
-                FlashMLABackend(
+                self.backend_cls(
                     model_runner,
                     skip_prefill=True,
                     kv_indptr_buf=self.kv_indptr[i],

@@ -469,6 +469,7 @@ class TestPPUCIDocker(CustomTestCase):
         self.assert_private_pull_log(result.stdout)
         create = self.assert_lifecycle()
         self.assertIn("--runtime=runc", create)
+        self.assertIn("--network=none", create)
         self.assertIn("NVIDIA_VISIBLE_DEVICES=void", create)
         self.assertIn("CUDA_VISIBLE_DEVICES=0", create)
         self.assertEqual(

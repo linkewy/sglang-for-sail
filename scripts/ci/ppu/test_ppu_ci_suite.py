@@ -63,6 +63,20 @@ class TestPPUCISuite(CustomTestCase):
             ],
         )
 
+    def test_attention_dispatch_changes_trigger_ppu_ci(self):
+        source = (
+            RUNNER.parent.parent / ".github/workflows/pr-test-ppu.yml"
+        ).read_text()
+        for path in (
+            "python/sglang/srt/layers/attention/attention_registry.py",
+            "python/sglang/srt/layers/attention/flashattention_backend.py",
+            "python/sglang/srt/layers/attention/flashmla_backend.py",
+            "python/sglang/kernels/ops/attention/flash_mla_interface.py",
+            "python/sglang/srt/speculative/draft_utils.py",
+        ):
+            with self.subTest(path=path):
+                self.assertIn(f'- "{path}"', source)
+
     def test_runtime_requires_every_sanity_file_to_pass(self):
         source = Path(__file__).with_name("build_and_test.sh").read_text()
         marker = 'cd "$artifacts"\n'

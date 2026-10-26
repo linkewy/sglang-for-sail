@@ -232,7 +232,7 @@ printf 'PPU CI artifacts: %s\n' "$private"
 
 # Synchronous creation prevents containers from appearing after cleanup.
 container="$prefix-test"
-docker create --name "$container" --runtime=runc --shm-size=16g \
+docker create --name "$container" --runtime=runc --network=none --shm-size=16g \
     --device=/dev/alixpu --device=/dev/alixpu_ctl --device=/dev/alixpu_sep \
     --device="/dev/alixpu_ppu$device" \
     --mount "type=bind,source=$repo,target=/source,readonly" \

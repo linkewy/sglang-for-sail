@@ -2,7 +2,10 @@
 
 from typing import TYPE_CHECKING
 
-from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+from sglang.srt.layers.attention.flashattention_backend import (
+    FlashAttentionBackend,
+    FlashAttentionMultiStepBackend,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -22,3 +25,9 @@ class SailFlashAttentionBackend(FlashAttentionBackend):
         self.flash_attn_varlen_func = flash_attn_varlen_func
         self.flash_attn_with_kvcache = flash_attn_with_kvcache
         self._get_scheduler_metadata = get_scheduler_metadata
+
+
+class SailFlashAttentionMultiStepBackend(FlashAttentionMultiStepBackend):
+    """Multi-step draft backend whose inner FA3 backends use SAIL kernels."""
+
+    backend_cls = SailFlashAttentionBackend

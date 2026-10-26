@@ -274,10 +274,11 @@ class FlashAttentionBackend(AttentionBackend):
         self.fa_impl_ver = fa_impl_ver
         device_capability = get_device_capability()
         if self.fa_impl_ver == 3:
-            from sgl_kernel.flash_attn import (
+            from sgl_kernel.flash_attn import get_scheduler_metadata
+
+            from sglang.kernels.ops.attention.flash_attention import (
                 flash_attn_varlen_func,
                 flash_attn_with_kvcache,
-                get_scheduler_metadata,
             )
 
             self._get_scheduler_metadata = get_scheduler_metadata
@@ -3474,6 +3475,8 @@ class FlashAttentionBackend(AttentionBackend):
 
 
 class FlashAttentionMultiStepBackend:
+    backend_cls = FlashAttentionBackend
+
     # Read by decide_needs_cpu_seq_lens (a missing flag defaults to True);
     # the multi-step draft and draft-extend paths are device-side.
     needs_cpu_seq_lens: bool = False
@@ -3492,7 +3495,7 @@ class FlashAttentionMultiStepBackend:
         self.attn_backends = []
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
-                FlashAttentionBackend(
+                self.backend_cls(
                     model_runner,
                     speculative_step_id=i,
                     topk=self.topk,

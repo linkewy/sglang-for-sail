@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.flashmla_backend import (
     PAGE_SIZE,
     FlashMLABackend,
     FlashMLADecodeMetadata,
+    FlashMLAMultiStepDraftBackend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -122,3 +123,9 @@ class SailFlashMLABackend(FlashMLABackend):
         if isinstance(metadata, FlashMLADecodeMetadata):
             assert metadata.flashmla_metadata is not None
             metadata.flashmla_metadata.have_initialized = False
+
+
+class SailFlashMLAMultiStepDraftBackend(FlashMLAMultiStepDraftBackend):
+    """Multi-step draft backend whose inner backends use SAIL metadata."""
+
+    backend_cls = SailFlashMLABackend

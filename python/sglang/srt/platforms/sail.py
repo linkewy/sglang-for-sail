@@ -42,8 +42,6 @@ class SailSRTPlatform(SailDeviceMixin, SRTPlatform):
     )
 
 
-# Load SAIL attention hooks when running on SAIL hardware.
-# Each module registers @plugin_hook decorators that inject SAIL-native ops
-# into the respective attention backends transparently.
+# Load the remaining SAIL DSA hooks when running on SAIL hardware.
 if is_sail_available():
     import sglang.srt.hardware_backend.sail.attention.sail_dsa_hooks  # noqa: F401

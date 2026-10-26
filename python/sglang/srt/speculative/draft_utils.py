@@ -9,6 +9,7 @@ from sglang.srt.utils.common import (
     is_hip,
     is_musa,
     is_npu,
+    is_sail,
 )
 
 
@@ -306,7 +307,11 @@ class DraftBackendFactory:
         )
 
     def _create_fa_decode_backend(self, fa_impl_ver: int = 3):
-        if not is_musa():
+        if is_sail() and fa_impl_ver == 3:
+            from sglang.srt.hardware_backend.sail.attention.flashattention_backend import (
+                SailFlashAttentionMultiStepBackend as FlashAttentionMultiStepBackend,
+            )
+        elif not is_musa():
             from sglang.srt.layers.attention.flashattention_backend import (
                 FlashAttentionMultiStepBackend,
             )
@@ -332,9 +337,14 @@ class DraftBackendFactory:
         return self._create_fa_decode_backend(fa_impl_ver=4)
 
     def _create_flashmla_decode_backend(self):
-        from sglang.srt.layers.attention.flashmla_backend import (
-            FlashMLAMultiStepDraftBackend,
-        )
+        if is_sail():
+            from sglang.srt.hardware_backend.sail.attention.flashmla_backend import (
+                SailFlashMLAMultiStepDraftBackend as FlashMLAMultiStepDraftBackend,
+            )
+        else:
+            from sglang.srt.layers.attention.flashmla_backend import (
+                FlashMLAMultiStepDraftBackend,
+            )
 
         return (
             "flashmla",
@@ -480,7 +490,11 @@ class DraftBackendFactory:
         return ("aiter", AiterAttnBackend(self.draft_model_runner, skip_prefill=False))
 
     def _create_fa_prefill_backend(self, fa_impl_ver: int = 3):
-        if not is_musa():
+        if is_sail() and fa_impl_ver == 3:
+            from sglang.srt.hardware_backend.sail.attention.flashattention_backend import (
+                SailFlashAttentionBackend as FlashAttentionBackend,
+            )
+        elif not is_musa():
             from sglang.srt.layers.attention.flashattention_backend import (
                 FlashAttentionBackend,
             )
@@ -530,7 +544,12 @@ class DraftBackendFactory:
         return ("ascend", AscendAttnBackend(self.draft_model_runner))
 
     def _create_flashmla_prefill_backend(self):
-        from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
+        if is_sail():
+            from sglang.srt.hardware_backend.sail.attention.flashmla_backend import (
+                SailFlashMLABackend as FlashMLABackend,
+            )
+        else:
+            from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
         return (
             "flashmla",
