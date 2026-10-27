@@ -392,6 +392,23 @@ class FlashAttentionBackend(AttentionBackend):
 
         return flash_attn_varlen_func(**kwargs)
 
+    def _call_raw_varlen_prefill(self, deterministic: bool, **kwargs):
+        """Call raw varlen attention without changing the normal FA dispatch."""
+        if deterministic:
+            return self._call_flash_attn_varlen_func(**kwargs)
+        return self.flash_attn_varlen_func(**kwargs)
+
+    def _use_deterministic_varlen_prefill(
+        self,
+        forward_batch: ForwardBatch,
+        layer: RadixAttention,
+        k,
+        v,
+        cp_active: bool,
+    ) -> bool:
+        """Whether a platform needs raw varlen attention for deterministic prefill."""
+        return False
+
     def _maybe_init_local_attn_builder(
         self, model_runner: ModelRunner
     ) -> Optional[LocalAttentionMetadataBuilder]:
@@ -1708,6 +1725,9 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
 
+            use_deterministic_varlen_prefill = self._use_deterministic_varlen_prefill(
+                forward_batch, layer, k, v, cp_active
+            )
             if cp_active:
 
                 def _fa_cp_attn(
@@ -1742,12 +1762,11 @@ class FlashAttentionBackend(AttentionBackend):
                     _fa_cp_attn,
                     attention_backend=CPAttentionBackendKind.FLASH_ATTENTION,
                 )
-            elif self.fa_skip_kv_cache:
-                # Embedding mode: skip KV cache read and use raw K/V tensors
-                # directly via flash_attn_varlen_func. The KV cache write is
-                # also skipped (guarded above). This eliminates store_kvcache
-                # and prepare_varlen_num_blocks overhead per layer.
-                assert k is not None, "fa_skip_kv_cache requires k to be provided"
+            elif self.fa_skip_kv_cache or use_deterministic_varlen_prefill:
+                # Use raw K/V tensors with varlen attention. Embedding mode also
+                # skips the KV write; platform deterministic fallbacks keep the
+                # write above so subsequent decode can read the populated cache.
+                assert k is not None, "raw varlen prefill requires k to be provided"
                 assert k_descale is None and v_descale is None, (
                     "fa_skip_kv_cache uses raw K/V tensors, "
                     "FP8 KV cache descaling is not supported in this mode"
@@ -1781,7 +1800,8 @@ class FlashAttentionBackend(AttentionBackend):
                     else:
                         metadata.fa_skip_cu_seqlens_q = cu_seqlens_q
                         metadata.fa_skip_max_seqlen_q = max_seqlen_q
-                result = self.flash_attn_varlen_func(
+                result = self._call_raw_varlen_prefill(
+                    deterministic=use_deterministic_varlen_prefill,
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v=v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
@@ -1794,6 +1814,7 @@ class FlashAttentionBackend(AttentionBackend):
                     window_size=window_size,
                     softcap=layer.logit_cap,
                     num_splits=self.num_splits,
+                    return_softmax_lse=return_lse,
                     out=_fa_out,
                     **kwargs,
                 )

@@ -220,6 +220,82 @@ def _sail_fa3_flashmla_qv_fallback(view: Any) -> dict:
     return {"prefill_attention_backend": "flashmla"}
 
 
+def _sail_fa3_deterministic_fallback(
+    view: Any, *, prefill_backend: str | None = None
+) -> dict:
+    if prefill_backend is None:
+        prefill_backend, _ = attention_backends_of(view)
+    if (
+        not get_platform().is_sail
+        or not view.enable_deterministic_inference
+        or prefill_backend != "fa3"
+        or use_mla_backend(view)
+    ):
+        return {}
+
+    model_config = model_config_of(view)
+    unsupported = []
+    if view.kv_cache_dtype != "auto":
+        unsupported.append(f"kv_cache_dtype={view.kv_cache_dtype}")
+    if view.enable_prefill_cp or view.attn_cp_size > 1 or view.dcp_size > 1:
+        unsupported.append("context parallelism")
+    if view.enable_unified_memory:
+        unsupported.append("unified memory")
+    if view.enable_kv_cache_sharding:
+        unsupported.append("KV-cache sharding")
+    if view.speculative_algorithm is not None:
+        unsupported.append("speculative decoding")
+    if view.pp_size > 1:
+        unsupported.append("pipeline parallelism")
+    if model_config.is_local_attention_model:
+        unsupported.append("local attention")
+    if model_config.is_encoder_decoder:
+        unsupported.append("cross attention")
+    if unsupported:
+        raise ValueError(
+            "SAIL FA3 deterministic varlen prefill does not support: "
+            + ", ".join(unsupported)
+        )
+
+    logger.warning(
+        "SAIL FA3 paged-KV prefill is not batch-invariant. "
+        "Serializing full cold self-attention prefills through deterministic "
+        "varlen attention."
+    )
+    return {
+        "cuda_graph_config": with_phase(
+            view.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+        ),
+        "chunked_prefill_size": -1,
+        "disable_overlap_schedule": True,
+        "disable_radix_cache": True,
+        "enable_dynamic_chunking": False,
+        "enable_mixed_chunk": False,
+        "prefill_max_requests": 1,
+    }
+
+
+def handle_sail_deterministic_fa3_prefill(server_args: Any) -> None:
+    """Declare SAIL deterministic prefill constraints before memory sizing."""
+    if not get_platform().is_sail:
+        return
+
+    view = resolved_view(server_args)
+    prefill_backend, _ = attention_backends_of(view)
+    constraints = _sail_fa3_deterministic_fallback(
+        view, prefill_backend=prefill_backend
+    )
+    if constraints:
+        # Some constraints are platform safety decisions rather than model
+        # overrides, so declare them directly. This hook runs before memory
+        # sizing so full-prefill activation headroom is reserved correctly.
+        declare_resolution(
+            server_args,
+            "_sail_fa3_deterministic_fallback",
+            **constraints,
+        )
+
+
 @register_post_process
 def _sail_flashmla_fp8_kv_cache_fallback(view: Any) -> dict:
     if not get_platform().is_sail or view.kv_cache_dtype not in (
@@ -255,6 +331,24 @@ def handle_sail_attention_backend_compatibility(server_args: Any):
     run_post_process_pass(server_args, _sail_fa3_flashmla_qv_fallback)
     run_post_process_pass(server_args, _sail_flashmla_fp8_kv_cache_fallback)
     cfg = resolved_view(server_args)
+    prefill_backend, _ = attention_backends_of(cfg)
+    deterministic_constraints_applied = any(
+        source == "_sail_fa3_deterministic_fallback"
+        for source, _ in getattr(server_args, "_resolved_overrides", ())
+    )
+    if cfg.enable_deterministic_inference:
+        if prefill_backend == "fa3" and not deterministic_constraints_applied:
+            raise ValueError(
+                "SAIL deterministic FA3 must be selected before memory sizing; "
+                "set --attention-backend fa3 (or --prefill-attention-backend "
+                "fa3) explicitly."
+            )
+        if deterministic_constraints_applied and prefill_backend != "fa3":
+            raise ValueError(
+                "SAIL deterministic prefill resolved to fa3 before memory "
+                f"sizing but changed to {prefill_backend!r} later. Set a "
+                "single explicit attention backend."
+            )
     if "fa3" in (
         cfg.attention_backend,
         *attention_backends_of(cfg),
